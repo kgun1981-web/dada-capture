@@ -1,7 +1,7 @@
 // 앱 화면 파일만 캐시합니다. 사진·메모는 IndexedDB에만 있고 네트워크로 보내지 않습니다.
 // 배포할 때마다 VERSION을 올립니다. 같은 주소의 다른 앱 캐시는 건드리지 않도록 이 앱 접두어 캐시만 정리·조회합니다.
 const PREFIX = 'dada-capture-shell-';
-const VERSION = PREFIX + 'v5';
+const VERSION = PREFIX + 'v6';
 const SHELL = ['./', './index.html', './app.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {

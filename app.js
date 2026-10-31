@@ -1,6 +1,6 @@
 'use strict';
 // 다다 기록 v0.1 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
-const APP_VERSION = '0.3.1';
+const APP_VERSION = '0.4.0';
 const SCHEMA_VERSION = 1;
 const $ = (id) => document.getElementById(id);
 
@@ -365,6 +365,34 @@ function buildZip(entries) { // entries: {name, data: Blob|Uint8Array, crc, size
   return new Blob([...parts, ...central, end.buffer], { type: 'application/zip' });
 }
 
+// ChatGPT 등에 첨부할 때 읽기 쉬운 Markdown 요약. 사진 내용 설명은 넣지 않음(사진을 보지 않았으므로)
+function notesMarkdown(r, photos, fileOf, partOf = {}, parts = 1) {
+  const cell = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+  const total = photos.reduce((s, p) => s + p.size, 0);
+  const L = [`# 다다 기록 — ${r.place}`, '',
+    `- **날짜**: ${r.date}`, `- **장소**: ${r.place}`, `- **주제**: ${r.topic || '(없음)'}`,
+    `- **기록 시간**: ${localStr(r.createdAt)} ~ ${r.endedAt ? localStr(r.endedAt) : '(기록 끝 누르지 않음)'}`,
+    `- **사진**: ${photos.length}장 (${fmtMB(total)})${parts > 1 ? ` · 묶음 ${parts}개로 나뉨` : ''}`,
+    `- **메모**: ${r.notes.length}개`, `- **기록번호**: ${r.id}`, '',
+    '> 아래 메모는 사용자가 현장에서 직접 쓴 내용입니다. 사진 목록은 파일 정보일 뿐이며 사진 내용 설명은 들어 있지 않습니다.', '',
+    '## 메모 (시간순)', ''];
+  if (!r.notes.length) L.push('(메모 없음)', '');
+  r.notes.forEach((n, i) => {
+    L.push(`### ${i + 1}. ${hhmm(n.at)}`, '', n.text, '');
+    const linked = n.photoIds.map((id) => fileOf[id]).filter(Boolean);
+    if (linked.length) L.push('연결 사진: ' + linked.map((f) => '`' + f + '`').join(', '), '');
+  });
+  L.push('## 사진 목록', '', `| 번호 | 파일 | 형식 | 크기 | 추가 시각 | 연결 메모${parts > 1 ? ' | 묶음' : ''} |`, `|---|---|---|---|---|---${parts > 1 ? '|---' : ''}|`);
+  for (const p of photos) {
+    const ns = r.notes.map((n, i) => (n.photoIds.includes(p.id) ? i + 1 : null)).filter(Boolean);
+    L.push(`| ${String(p.seq).padStart(3, '0')} | ${cell(fileOf[p.id])} | ${cell(p.kind.toUpperCase())}${p.formatOk ? '' : ' (확인 필요)'} | ${fmtMB(p.size)} | ${hhmm(p.addedAt)} | ${ns.length ? ns.map((x) => '메모 ' + x).join(', ') : '-'}${parts > 1 ? ` | ${partOf[p.id] || '-'}` : ''} |`);
+  }
+  if (!photos.length) L.push('| - | (사진 없음) | | | | |');
+  const unlinked = photos.filter((p) => !r.notes.some((n) => n.photoIds.includes(p.id)));
+  if (photos.length) { L.push('', '## 메모가 연결되지 않은 사진', ''); L.push(unlinked.length ? unlinked.map((p) => '- `' + fileOf[p.id] + '`').join('\n') : '(없음 — 모든 사진에 메모가 연결됨)'); }
+  return L.join('\n') + '\n';
+}
+
 function notesText(r, photos, fileOf) {
   const lines = ['다다 기록', `기록번호: ${r.id}`, `날짜: ${r.date}`, `장소: ${r.place}`, `주제: ${r.topic || ''}`,
     `시작: ${localStr(r.createdAt)}`, `끝: ${r.endedAt ? localStr(r.endedAt) : '(기록 끝 누르지 않음)'}`, `사진: ${photos.length}장`, ''];
@@ -397,7 +425,7 @@ async function exportRecord() {
     const notes = enc.encode(notesText(r, photos, fileOf));
     // 묶음 나누기: 사진 + ZIP 머리글 + notes/manifest 예상 크기까지 포함한 실제 ZIP 크기 기준 (사진 순서 유지)
     const entryCost = (p) => p.size + 76 + 2 * enc.encode(`${base}/${fileOf[p.id]}`).length;
-    const fixedCost = 2 * notes.length + enc.encode(JSON.stringify(r.log)).length * 2 + photos.length * 900 + 4096;
+    const fixedCost = 3 * notes.length + photos.length * 250 + enc.encode(JSON.stringify(r.log)).length * 2 + photos.length * 900 + 4096;
     const groups = [[]]; let acc = fixedCost;
     for (const p of photos) {
       if (limit && acc + entryCost(p) > limit && groups[groups.length - 1].length) { groups.push([]); acc = fixedCost; }
@@ -419,6 +447,9 @@ async function exportRecord() {
     };
     const contentHash = await sha256(enc.encode(JSON.stringify(body)));
     const notesHash = await sha256(notes);
+    const partOf = {}; groups.forEach((g, gi) => g.forEach((p) => { partOf[p.id] = gi + 1; }));
+    const md = enc.encode(notesMarkdown(r, photos, fileOf, partOf, groups.length));
+    const mdHash = await sha256(md);
     const results = []; const oversize = [];
     for (let gi = 0; gi < groups.length; gi++) {
       const entries = [];
@@ -437,12 +468,13 @@ async function exportRecord() {
         export_id: exportId, exported_at: exportedAt, part: gi + 1, parts: groups.length,
         part_files: groups[gi].map((p) => fileOf[p.id]), part_bytes: groups[gi].reduce((s, p) => s + p.size, 0),
         photo_count: photos.length, total_bytes: photos.reduce((s, p) => s + p.size, 0),
-        content_hash: contentHash, notes_sha256: notesHash,
+        content_hash: contentHash, notes_sha256: notesHash, notes_md_file: '기록.md', notes_md_sha256: mdHash,
         photos: manifestPhotos, notes: manifestNotes,
         events: r.log, uploaded: false, published: false,
       };
       const mBytes = enc.encode(JSON.stringify(manifest, null, 2));
       entries.push({ name: `${base}/notes.txt`, data: notes, crc: crc32(notes), size: notes.length });
+      entries.push({ name: `${base}/기록.md`, data: md, crc: crc32(md), size: md.length });
       entries.push({ name: `${base}/manifest.json`, data: mBytes, crc: crc32(mBytes), size: mBytes.length });
       const zip = buildZip(entries);
       const zname = groups.length > 1 ? `${base}_part${gi + 1}of${groups.length}.zip` : `${base}.zip`;
@@ -483,12 +515,12 @@ function showExport(files, photos, fileOf, oversize = []) {
     row.append(share, a); out.appendChild(row);
   });
   // 큰 묶음이 실패할 때를 위한 개별 공유 경로
-  const ind = document.createElement('button'); ind.className = 'secondary'; ind.textContent = '사진 원본 + notes.txt 개별 공유';
+  const ind = document.createElement('button'); ind.className = 'secondary'; ind.textContent = '사진 원본 + 기록.md 개별 공유';
   ind.onclick = async () => {
     if (!$('wifiOk').checked) { flash('먼저 Wi-Fi 연결을 직접 확인하고 체크하세요.', 'err'); return; }
     const list = [];
     for (const p of photos) { const b = await getOne('blobs', p.id); list.push(new File([b], fileOf[p.id].replace('photos/', ''), { type: p.mime || 'application/octet-stream' })); }
-    list.push(new File([notesText(current, photos, fileOf)], 'notes.txt', { type: 'text/plain;charset=utf-8' }));
+    list.push(new File([notesMarkdown(current, photos, fileOf)], '기록.md', { type: 'text/markdown;charset=utf-8' }));
     if (!canShare(list)) { flash('한 번에 공유할 수 없는 크기·형식입니다. 묶음 나누기(50MB)를 선택하세요.', 'err'); return; }
     try { await navigator.share({ files: list }); } catch (e) { flash(e.name === 'AbortError' ? '공유 취소. 원본은 그대로입니다.' : '공유 실패: ' + e.message, 'err'); }
   };
