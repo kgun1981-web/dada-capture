@@ -1,6 +1,6 @@
 'use strict';
-// 다다 기록 v0.1 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
-const APP_VERSION = '0.5.2';
+// 다다 기록 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
+const APP_VERSION = '0.5.3';
 const HASH_VERSION = 2; // content_hash 규칙 버전 (2: 사진 설명·촬영 시각 포함)
 const TAGS = ['맛', '가격', '분위기', '주차', '팁', '확인 필요'];
 const SCHEMA_VERSION = 1;
@@ -8,6 +8,8 @@ const $ = (id) => document.getElementById(id);
 
 /* ---------- IndexedDB ---------- */
 let db;
+let current = null; // 현재 열린 기록
+let lastBatch = []; // 방금 추가한 사진 id
 function openDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open('dada-capture', 1);
@@ -33,7 +35,6 @@ function tx(stores, mode, fn) {
     out = fn(t);
   });
 }
-const reqP = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
 const getAll = (store, index, key) => tx([store], 'readonly', (t) => {
   const s = t.objectStore(store);
   const r = index ? s.index(index).getAll(key) : s.getAll();
@@ -147,8 +148,6 @@ async function hasRoomFor(bytes) {
 }
 
 /* ---------- 상태 ---------- */
-let current = null; // 현재 열린 기록
-let lastBatch = []; // 방금 추가한 사진 id
 
 // 내보내기 상태: 'empty' 내용 없음 / 'never' 아직 안 함 / 'changed' 내보낸 뒤 바뀜 / 'ok' 최신
 const shortKind = (k) => ({ jpeg: 'JPG', heic: 'HEIC', png: 'PNG', webp: 'WEBP', gif: 'GIF', mov: 'MOV', unknown: '?' }[k] || k.toUpperCase().slice(0, 4));
@@ -318,11 +317,12 @@ async function startRecord() {
 }
 
 async function openRecord(id) {
+  homeToken++; // 진행 중인 목록 그리기 중단(기록 화면에 목록 경고가 다시 뜨지 않게)
   $('flash').innerHTML = ''; $('exportOut').innerHTML = '';
   current = await getOne('records', id);
   if (!current || current.trashedAt) { current = null; return renderHome(); }
   lastBatch = []; endEditNote();
-  try { localStorage.setItem('dada.open', id); } catch (e) { /* 무시 */ }
+  try { localStorage.setItem('dada.open', id); const d = localStorage.getItem('dada.draft.' + id); if (d) $('noteText').value = d; } catch (e) { /* 무시 */ }
   $('viewHome').classList.add('hidden'); $('viewRecord').classList.remove('hidden'); $('pendingMsg').classList.add('hidden');
   await renderRecord();
 }
@@ -398,12 +398,20 @@ async function renderRecord() {
 }
 
 /* ---------- 사진 저장 ---------- */
-async function addFiles(fileList) {
+// 사진 저장은 한 번에 하나씩 차례로 처리(저장 중 다시 고르면 뒤에 줄 섬 → 사진 번호가 겹치지 않음)
+let addQueue = Promise.resolve(), queued = 0;
+function addFiles(fileList) {
   const files = Array.from(fileList || []);
-  if (!files.length) return;
-  if (!current) { flash(`기록이 아직 열리지 않아 사진 ${files.length}장을 저장하지 않았습니다. 기록을 연 뒤 다시 고르세요.`, 'err'); return; }
+  if (!files.length) return Promise.resolve();
+  if (!current) { flash(`기록이 아직 열리지 않아 사진 ${files.length}장을 저장하지 않았습니다. 기록을 연 뒤 다시 고르세요.`, 'err'); return Promise.resolve(); }
+  const rid = current.id; // 고른 시점의 기록에 저장
+  queued++; if (queued > 1) $('progress').textContent = `앞의 사진 저장이 끝나면 이어서 ${files.length}장을 저장합니다…`;
+  addQueue = addQueue.then(() => addFilesNow(files, rid)).catch((e) => flash('사진 저장 중 오류: ' + e.message, 'err')).finally(() => { queued--; });
+  return addQueue;
+}
+async function addFilesNow(files, rid) {
   const prog = $('progress');
-  const rid = current.id, logs = []; // 저장 도중 다른 화면으로 가도 이 기록에만 저장
+  const logs = []; // 저장 도중 다른 화면으로 가도 이 기록에만 저장
   const existing = await getAll('photos', 'byRecord', rid);
   let seq = existing.reduce((m, p) => Math.max(m, p.seq), 0);
   const saved = [], skipped = [], failed = [];
@@ -458,12 +466,13 @@ async function addFiles(fileList) {
   await renderRecord(); storageCheck();
 }
 
-let editingNote = null;
+let editingNote = null, draftBeforeEdit = '';
 function startEditNote(n) {
+  if (!editingNote) draftBeforeEdit = $('noteText').value;
   editingNote = n; $('noteText').value = n.text; $('btnNote').textContent = '고친 메모 저장'; $('btnNoteCancel').classList.remove('hidden');
   $('noteCard').scrollIntoView({ block: 'start' }); $('noteText').focus();
 }
-function endEditNote() { editingNote = null; $('noteText').value = ''; $('btnNote').textContent = '메모 저장'; $('btnNoteCancel').classList.add('hidden'); }
+function endEditNote() { const was = !!editingNote; editingNote = null; $('noteText').value = was ? draftBeforeEdit : ''; draftBeforeEdit = ''; $('btnNote').textContent = '메모 저장'; $('btnNoteCancel').classList.add('hidden'); }
 async function editCaption(p) {
   const v = prompt(`${String(p.seq).padStart(3, '0')}번 사진 한 줄 설명 (예: 첨성대 정면, 해 질 무렵)`, p.caption || '');
   if (v === null) return;
@@ -488,7 +497,7 @@ async function saveNote() {
     try { await mutate(current.id, (x) => { const m = x.notes.find((y) => y.id === n.id); if (!m) return; found = true; m.text = text; m.editedAt = at; x.updatedAt = at; x.log.push({ type: 'note_edited', at, note_id: n.id }); }); }
     catch (e) { flash('고친 메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
     if (!found) { flash('고치려던 메모가 이미 지워졌습니다. 입력 내용은 그대로 두었으니 새 메모로 저장하려면 "고치기 취소" 후 다시 붙여 넣으세요.', 'err'); return; }
-    endEditNote(); try { localStorage.removeItem('dada.draft.' + current.id); } catch (e) { /* 무시 */ }
+    draftBeforeEdit = ''; endEditNote(); try { localStorage.removeItem('dada.draft.' + current.id); } catch (e) { /* 무시 */ }
     flash('메모를 고쳤습니다.', 'ok'); await renderRecord(); return;
   }
   const note = { id: 'n' + Date.now().toString(36), at: nowISO(), text, photoIds: $('noteLink').checked ? [...lastBatch] : [] };
@@ -714,12 +723,18 @@ function showExport(files, photos, fileOf, oversize = [], rec = current) {
     row.append(share, a); out.appendChild(row);
   });
   // 큰 묶음이 실패할 때를 위한 개별 공유 경로
-  const ind = document.createElement('button'); ind.className = 'secondary'; ind.textContent = '사진 원본 + 기록.md 개별 공유';
+  const ind = document.createElement('button'); ind.className = 'secondary'; ind.textContent = '사진 원본 + 기록.md 개별 공유 (준비 중…)';
+  // 아이폰은 버튼을 누른 뒤 시간이 걸리면 공유 창을 막을 수 있어, 파일 목록을 미리 만들어 둠
+  let list = null;
+  (async () => {
+    const l = [];
+    for (const p of photos) { const b = await getOne('blobs', p.id); if (b) l.push(new File([b], fileOf[p.id].replace('photos/', ''), { type: p.mime || 'application/octet-stream' })); }
+    l.push(new File([notesMarkdown(rec, photos, fileOf)], '기록.md', { type: 'text/markdown;charset=utf-8' }));
+    list = l; ind.textContent = `사진 원본 ${photos.length}장 + 기록.md 개별 공유`;
+  })();
   ind.onclick = async () => {
     if (needWifi()) return;
-    const list = [];
-    for (const p of photos) { const b = await getOne('blobs', p.id); list.push(new File([b], fileOf[p.id].replace('photos/', ''), { type: p.mime || 'application/octet-stream' })); }
-    list.push(new File([notesMarkdown(rec, photos, fileOf)], '기록.md', { type: 'text/markdown;charset=utf-8' }));
+    if (!list) { say('개별 공유 파일을 준비하는 중입니다. 잠시 후 다시 누르세요.', 'info'); return; }
     if (!canShare(list)) { say('한 번에 공유할 수 없는 크기·형식입니다. 묶음별 공유 버튼을 쓰세요.', 'err'); return; }
     try { await navigator.share({ files: list }); say('공유 시트로 넘겼습니다.', 'ok'); } catch (e) { say(e.name === 'AbortError' ? '공유 취소. 원본은 그대로입니다.' : '공유 실패: ' + e.message, 'err'); }
   };
@@ -743,7 +758,7 @@ async function init() {
   const chips = $('tagChips'); TAGS.forEach((t) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'chip'; b.textContent = t; b.onclick = () => addTag(t); chips.appendChild(b); });
   $('appVersion').textContent = 'v' + APP_VERSION;
   // 메모 입력 중 앱이 닫혀도 초안 유지
-  $('noteText').oninput = () => { try { if (current) localStorage.setItem('dada.draft.' + current.id, $('noteText').value); } catch (e) { /* 무시 */ } };
+  $('noteText').oninput = () => { try { if (current && !editingNote) localStorage.setItem('dada.draft.' + current.id, $('noteText').value); } catch (e) { /* 무시 */ } };
   window.addEventListener('online', netState); window.addEventListener('offline', netState); netState();
   try { db = await openDB(); } catch (e) { flash('앱 저장소를 열 수 없습니다(개인정보 보호 모드인지 확인): ' + e.message, 'err'); return; }
   storageCheck();
@@ -757,7 +772,7 @@ async function init() {
     });
   }
   let openId = ''; try { openId = localStorage.getItem('dada.open') || ''; } catch (e) { /* 무시 */ }
-  if (openId) { await openRecord(openId); try { const d = localStorage.getItem('dada.draft.' + openId); if (d) $('noteText').value = d; } catch (e) { /* 무시 */ } }
+  if (openId) await openRecord(openId);
   else await renderHome();
   window.__dadaReady = true;
 }
