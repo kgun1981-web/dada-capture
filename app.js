@@ -1,6 +1,6 @@
 'use strict';
 // 다다 기록 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
-const APP_VERSION = '0.5.3';
+const APP_VERSION = '0.5.4';
 const HASH_VERSION = 2; // content_hash 규칙 버전 (2: 사진 설명·촬영 시각 포함)
 const TAGS = ['맛', '가격', '분위기', '주차', '팁', '확인 필요'];
 const SCHEMA_VERSION = 1;
@@ -185,7 +185,7 @@ async function renderHome() {
   }
   const pb = $('pendingMsg');
   pb.classList.toggle('hidden', !pending.length);
-  if (pending.length) pb.textContent = `내보내지 않은(또는 내보낸 뒤 바뀐) 기록 ${pending.length}개: ${pending.join(', ')}. 휴대폰 분실·고장에 대비해 기록을 열어 '내보내기 묶음 만들기' → '파일로 저장'을 해 두세요.`;
+  if (pending.length) pb.textContent = `내보내지 않은(또는 내보낸 뒤 바뀐) 기록 ${pending.length}개: ${pending.join(', ')}. 휴대폰 분실·고장에 대비해 기록을 열어 '내보내기 묶음 만들기' → '공유' → '파일에 저장' → iCloud Drive/DadaRecords에 저장해 두세요.`;
   try { localStorage.setItem('dada.open', ''); } catch (e) { /* 무시 */ }
 }
 
@@ -299,10 +299,10 @@ async function makeDaySummary() {
     const sh = document.createElement('button'); sh.textContent = '공유';
     sh.onclick = async () => {
       let ok = false; try { ok = !!(navigator.canShare && navigator.canShare({ files: [f] })); } catch (e) { /* 무시 */ }
-      if (!ok) { m.className = 'msg err'; m.textContent = '이 기기에서는 공유 시트로 넘길 수 없습니다. "파일로 저장"을 쓰세요.'; return; }
+      if (!ok) { m.className = 'msg err'; m.textContent = '이 기기에서는 공유 시트로 넘길 수 없습니다. "다운로드" 버튼을 쓰세요.'; return; }
       try { await navigator.share({ files: [f], title: f.name }); m.className = 'msg ok'; m.textContent = `${f.name}을(를) 공유 시트로 넘겼습니다.`; } catch (e) { if (e.name !== 'AbortError') { m.className = 'msg err'; m.textContent = '공유 실패: ' + e.message; } }
     };
-    const a = document.createElement('a'); a.className = 'btn'; a.style.background = '#e9e1d1'; a.style.color = '#1d2522'; a.href = URL.createObjectURL(f); a.download = f.name; a.textContent = '파일로 저장 (다운로드)';
+    const a = document.createElement('a'); a.className = 'btn'; a.style.background = '#e9e1d1'; a.style.color = '#1d2522'; a.href = URL.createObjectURL(f); a.download = f.name; a.textContent = '다운로드 (공유가 안 될 때)';
     out.append(sh, a);
   } catch (e) { const m = document.createElement('div'); m.className = 'msg err'; m.textContent = '요약을 만들지 못했습니다: ' + e.message; out.appendChild(m); }
 }
@@ -714,12 +714,12 @@ function showExport(files, photos, fileOf, oversize = [], rec = current) {
     const share = document.createElement('button'); share.textContent = `공유: ${f.name} (${fmtMB(f.size)})`;
     share.onclick = async () => {
       if (needWifi()) return;
-      if (!canShare([f])) { say('이 기기에서는 공유 시트로 이 파일을 넘길 수 없습니다. "파일로 저장"을 쓰세요.', 'err'); return; }
+      if (!canShare([f])) { say('이 기기에서는 공유 시트로 이 파일을 넘길 수 없습니다. "다운로드" 버튼을 쓰세요.', 'err'); return; }
       try { await navigator.share({ files: [f], title: f.name }); share.textContent = `✓ 공유함: ${f.name} (${fmtMB(f.size)})`; share.classList.add('done'); say(`${f.name}을(를) 공유 시트로 넘겼습니다. 저장·첨부가 끝났는지는 받는 앱(파일 앱 등)에서 확인하세요.${files.length > 1 ? ` 묶음 ${files.length}개를 모두 보내야 합니다.` : ''}`, 'ok'); }
-      catch (e) { say(e.name === 'AbortError' ? '공유를 취소했습니다. 묶음과 원본은 그대로입니다.' : '공유 실패: ' + e.message + ' — 다시 시도하거나 파일로 저장하세요.', 'err'); }
+      catch (e) { say(e.name === 'AbortError' ? '공유를 취소했습니다. 묶음과 원본은 그대로입니다.' : '공유 실패: ' + e.message + ' — 다시 시도하거나 "다운로드" 버튼을 쓰세요.', 'err'); }
     };
     const a = document.createElement('a'); a.className = 'btn'; a.style.background = '#e9e1d1'; a.style.color = '#1d2522';
-    a.href = URL.createObjectURL(f); a.download = f.name; a.textContent = '파일로 저장 (다운로드)';
+    a.href = URL.createObjectURL(f); a.download = f.name; a.textContent = '다운로드 (공유가 안 될 때)';
     row.append(share, a); out.appendChild(row);
   });
   // 큰 묶음이 실패할 때를 위한 개별 공유 경로
