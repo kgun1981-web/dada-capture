@@ -37,13 +37,19 @@ ul.list li:first-child{border-top:0}
 .thumbs div{aspect-ratio:1;border-radius:8px;background:#e9e1d1;overflow:hidden;font-size:11px;display:flex;align-items:center;justify-content:center;text-align:center;position:relative}
 .thumbs img{width:100%;height:100%;object-fit:cover}
 .thumbs .dup{position:absolute;inset:auto 0 0 0;background:rgba(162,64,31,.85);color:#fff}
+.thumbs .tag{position:absolute;top:4px;left:4px;background:rgba(29,37,34,.75);color:#fff;font-size:10px;padding:1px 5px;border-radius:6px}
+.thumbs .del{position:absolute;top:2px;right:2px;width:30px;height:30px;margin:0;padding:0;border-radius:50%;background:rgba(29,37,34,.75);color:#fff;font-size:18px;line-height:30px}
+button.danger{background:#a2401f}
+.link-del{display:inline;width:auto;background:none;color:var(--warn);font-size:13px;font-weight:500;padding:4px 0;margin:4px 0 0}
+#updateBar button{margin-top:6px}
 .hidden{display:none}
 .check{display:flex;gap:8px;align-items:flex-start;font-size:14px;margin-top:10px}
 .check input{margin-top:4px}
 </style>
 </head>
 <body>
-<header><h1>다다 기록</h1><span class="status" id="netState"></span></header>
+<header><h1>다다 기록</h1><span class="status"><span id="netState"></span> · <span id="appVersion"></span></span></header>
+<div id="updateBar" class="msg info hidden">새 버전이 준비됐습니다. 저장이 끝난 뒤 눌러 주세요.<button class="secondary" onclick="location.reload()">새 버전 적용</button></div>
 <div id="storageMsg" class="msg info hidden"></div>
 <div id="flash"></div>
 
@@ -59,6 +65,11 @@ ul.list li:first-child{border-top:0}
     <h2>저장된 기록</h2>
     <ul class="list" id="recordList"></ul>
   </div>
+  <div class="card hidden" id="trashCard">
+    <h2>휴지통</h2>
+    <p class="status">여기 있는 기록은 복구할 수 있습니다. '완전 삭제'만 되돌릴 수 없습니다. 앱은 스스로 지우지 않습니다.</p>
+    <ul class="list" id="trashList"></ul>
+  </div>
 </section>
 
 <section id="viewRecord" class="hidden">
@@ -69,7 +80,7 @@ ul.list li:first-child{border-top:0}
   </div>
   <div class="card" id="captureCard">
     <h2>사진 추가</h2>
-    <p class="status">사진 앱의 원본을 고르거나 바로 찍습니다. 저장이 끝나기 전에는 '저장됨'으로 표시하지 않습니다.</p>
+    <p class="status">사진 앱의 원본을 고르거나 바로 찍습니다. 저장이 끝나기 전에는 '저장됨'으로 표시하지 않습니다. 사진 오른쪽 위 ×로 이 기록에서만 지울 수 있습니다(사진 앱 원본은 그대로).</p>
     <div class="row">
       <label class="btn" for="inPick" style="color:#fff;margin-top:6px">사진 고르기</label>
       <label class="btn" for="inShoot" style="color:#fff;margin-top:6px;background:var(--accent)">바로 찍기</label>
@@ -104,6 +115,7 @@ ul.list li:first-child{border-top:0}
     <div id="exportOut"></div>
     <p class="status">공유 시트에서 '파일에 저장' 또는 ChatGPT를 고릅니다. ChatGPT에 첨부하는 순간 파일이 그쪽 서버로 올라갑니다. 앱 안의 원본은 지우지 않습니다.</p>
     <button class="secondary" id="btnBack">목록으로</button>
+    <button class="danger" id="btnTrash">이 기록을 휴지통으로</button>
   </div>
 </section>
 <script src="app.js"></script>

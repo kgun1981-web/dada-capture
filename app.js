@@ -1,6 +1,6 @@
 'use strict';
 // 다다 기록 v0.1 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.3.0';
 const SCHEMA_VERSION = 1;
 const $ = (id) => document.getElementById(id);
 
@@ -98,9 +98,11 @@ let lastBatch = []; // 방금 추가한 사진 id
 
 async function renderHome() {
   $('viewHome').classList.remove('hidden'); $('viewRecord').classList.add('hidden'); $('flash').innerHTML = '';
-  const recs = (await getAll('records')).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const all = (await getAll('records')).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const recs = all.filter((r) => !r.trashedAt), trash = all.filter((r) => r.trashedAt);
   const ul = $('recordList'); ul.innerHTML = '';
   if (!recs.length) { ul.innerHTML = '<li class="status">아직 기록이 없습니다.</li>'; }
+  renderTrash(trash);
   for (const r of recs) {
     const photos = await getAll('photos', 'byRecord', r.id);
     const li = document.createElement('li');
@@ -112,6 +114,69 @@ async function renderHome() {
   }
   try { localStorage.setItem('dada.open', ''); } catch (e) { /* 무시 */ }
 }
+
+async function renderTrash(trash) {
+  const box = $('trashCard'), ul = $('trashList');
+  box.classList.toggle('hidden', !trash.length); ul.innerHTML = '';
+  for (const r of trash) {
+    const photos = await getAll('photos', 'byRecord', r.id);
+    const li = document.createElement('li');
+    li.innerHTML = '<strong></strong><div class="status"></div><div class="row"></div>';
+    li.querySelector('strong').textContent = `${r.date} · ${r.place}`;
+    li.querySelector('.status').textContent = `사진 ${photos.length}장 · 메모 ${r.notes.length}개 · 휴지통으로 옮긴 시각 ${localStr(r.trashedAt)}${r.exports.length ? '' : ' · 한 번도 내보내지 않음'}`;
+    const rb = document.createElement('button'); rb.className = 'secondary'; rb.textContent = '복구';
+    rb.onclick = async () => { delete r.trashedAt; r.log.push({ type: 'restored', at: nowISO() }); await putRecord(r); flash(`'${r.place}' 기록을 복구했습니다.`, 'ok'); renderHome(); };
+    const db_ = document.createElement('button'); db_.className = 'danger'; db_.textContent = '완전 삭제';
+    db_.onclick = () => purgeRecord(r, photos.length);
+    li.querySelector('.row').append(rb, db_); ul.appendChild(li);
+  }
+}
+
+async function purgeRecord(r, count) {
+  const warn = r.exports.length ? '' : '\n\n주의: 이 기록은 한 번도 내보내지 않았습니다. 메모는 다른 곳에 사본이 없습니다.';
+  if (!confirm(`'${r.date} ${r.place}' 기록을 완전히 지울까요?\n사진 ${count}장(앱 안 사본)과 메모 ${r.notes.length}개가 사라지며 되돌릴 수 없습니다.\n사진 앱의 원본 사진은 그대로입니다.${warn}`)) return;
+  try {
+    const photos = await getAll('photos', 'byRecord', r.id);
+    await tx(['records', 'photos', 'blobs'], 'readwrite', (t) => {
+      for (const p of photos) { t.objectStore('blobs').delete(p.id); t.objectStore('photos').delete(p.id); }
+      t.objectStore('records').delete(r.id);
+    });
+    try { localStorage.removeItem('dada.draft.' + r.id); } catch (e) { /* 무시 */ }
+    await renderHome(); flash(`'${r.place}' 기록을 완전히 지웠습니다.`, 'ok');
+  } catch (e) { flash('삭제하지 못했습니다(자료는 그대로입니다): ' + e.message, 'err'); }
+}
+
+async function trashRecord() {
+  const r = current; const photos = await getAll('photos', 'byRecord', r.id);
+  const lastExport = r.exports.length ? r.exports[r.exports.length - 1].at : null;
+  const unexported = !lastExport ? '\n\n이 기록은 아직 내보내지 않았습니다.' : (r.updatedAt && r.updatedAt > lastExport ? '\n\n마지막 내보내기 뒤에 바뀐 내용이 있습니다.' : '');
+  if (!confirm(`'${r.place}' 기록(사진 ${photos.length}장, 메모 ${r.notes.length}개)을 휴지통으로 옮길까요?\n휴지통에서 복구할 수 있습니다.${unexported}`)) return;
+  r.trashedAt = nowISO(); r.log.push({ type: 'trashed', at: r.trashedAt });
+  try { await putRecord(r); } catch (e) { delete r.trashedAt; flash('옮기지 못했습니다: ' + e.message, 'err'); return; }
+  current = null; await renderHome(); flash(`'${r.place}' 기록을 휴지통으로 옮겼습니다. 목록 아래 휴지통에서 복구할 수 있습니다.`, 'ok');
+}
+
+async function deletePhoto(p) {
+  if (!confirm(`${String(p.seq).padStart(3, '0')}번 사진(${p.originalName}, ${fmtMB(p.size)})을 이 기록에서 지울까요?\n앱 안 사본만 지워지고 사진 앱의 원본은 그대로입니다.`)) return;
+  try {
+    await tx(['photos', 'blobs'], 'readwrite', (t) => { t.objectStore('blobs').delete(p.id); t.objectStore('photos').delete(p.id); });
+  } catch (e) { flash('사진을 지우지 못했습니다: ' + e.message, 'err'); return; }
+  for (const n of current.notes) n.photoIds = n.photoIds.filter((id) => id !== p.id);
+  lastBatch = lastBatch.filter((id) => id !== p.id);
+  current.log.push({ type: 'photo_removed', at: nowISO(), name: p.originalName, sha256: p.sha256, seq: p.seq });
+  await touch(); flash(`${String(p.seq).padStart(3, '0')}번 사진을 지웠습니다.`, 'ok'); await renderRecord();
+}
+
+async function deleteNote(n) {
+  const short = n.text.length > 40 ? n.text.slice(0, 40) + '…' : n.text;
+  if (!confirm(`이 메모를 지울까요?\n\n"${short}"\n\n되돌릴 수 없습니다.`)) return;
+  const idx = current.notes.indexOf(n); current.notes.splice(idx, 1);
+  current.log.push({ type: 'note_removed', at: nowISO(), note_id: n.id });
+  try { await touch(); } catch (e) { current.notes.splice(idx, 0, n); current.log.pop(); flash('메모를 지우지 못했습니다: ' + e.message, 'err'); return; }
+  flash('메모를 지웠습니다.', 'ok'); await renderRecord();
+}
+
+async function touch() { current.updatedAt = nowISO(); await putRecord(current); }
 
 async function startRecord() {
   const date = $('fDate').value, place = $('fPlace').value.trim(), topic = $('fTopic').value.trim();
@@ -125,7 +190,7 @@ async function startRecord() {
 async function openRecord(id) {
   $('flash').innerHTML = ''; $('exportOut').innerHTML = '';
   current = await getOne('records', id);
-  if (!current) { flash('기록을 찾지 못했습니다.', 'err'); return renderHome(); }
+  if (!current || current.trashedAt) { current = null; return renderHome(); }
   lastBatch = [];
   try { localStorage.setItem('dada.open', id); } catch (e) { /* 무시 */ }
   $('viewHome').classList.add('hidden'); $('viewRecord').classList.remove('hidden');
@@ -169,6 +234,9 @@ async function renderRecord() {
       d.appendChild(img);
     } else d.textContent = `${String(p.seq).padStart(3, '0')} ${p.kind}`;
     if (p.alsoIn && p.alsoIn.length) { const t = document.createElement('span'); t.className = 'dup'; t.textContent = '다른 기록에도 있음'; d.appendChild(t); }
+    const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = `${String(p.seq).padStart(3, '0')} ${p.kind.toUpperCase()}`; d.appendChild(tag);
+    const x = document.createElement('button'); x.className = 'del'; x.type = 'button'; x.setAttribute('aria-label', `${p.seq}번 사진 지우기`); x.textContent = '×';
+    x.onclick = () => deletePhoto(p); d.appendChild(x);
     th.appendChild(d);
   }
   const nl = $('noteList'); nl.innerHTML = '';
@@ -177,6 +245,7 @@ async function renderRecord() {
     li.textContent = `[${hhmm(n.at)}] ${n.text}`;
     if (n.photoIds.length) { const s = document.createElement('div'); s.className = 'status';
       s.textContent = '연결 사진: ' + n.photoIds.map((id) => { const p = photos.find((x) => x.id === id); return p ? String(p.seq).padStart(3, '0') : '?'; }).join(', '); li.appendChild(s); }
+    const del = document.createElement('button'); del.className = 'link-del'; del.type = 'button'; del.textContent = '메모 지우기'; del.onclick = () => deleteNote(n); li.appendChild(del);
     nl.appendChild(li);
   }
 }
@@ -226,6 +295,7 @@ async function addFiles(fileList) {
       failed.push(`${f.name}: ${msg}`); current.log.push({ type: 'save_failed', at: nowISO(), name: f.name, error: msg });
     }
   }
+  if (saved.length) current.updatedAt = nowISO();
   try { await putRecord(current); } catch (e) { failed.push('기록 정보 갱신 실패: ' + e.message); }
   prog.textContent = '';
   let text = `저장됨 ${saved.length}장.`;
@@ -241,7 +311,7 @@ async function saveNote() {
   const text = $('noteText').value.trim();
   if (!text) { flash('메모 내용을 입력하세요.', 'err'); return; }
   const note = { id: 'n' + Date.now().toString(36), at: nowISO(), text, photoIds: $('noteLink').checked ? [...lastBatch] : [] };
-  current.notes.push(note);
+  current.notes.push(note); current.updatedAt = nowISO();
   try { await putRecord(current); } catch (e) { current.notes.pop(); flash('메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
   $('noteText').value = ''; $('noteLink').checked = false;
   try { localStorage.removeItem('dada.draft.' + current.id); } catch (e) { /* 무시 */ }
@@ -427,12 +497,22 @@ async function init() {
   $('btnFinish').onclick = finishRecord;
   $('btnExport').onclick = exportRecord;
   $('btnBack').onclick = () => { current = null; renderHome(); };
+  $('btnTrash').onclick = trashRecord;
+  $('appVersion').textContent = 'v' + APP_VERSION;
   // 메모 입력 중 앱이 닫혀도 초안 유지
   $('noteText').oninput = () => { try { if (current) localStorage.setItem('dada.draft.' + current.id, $('noteText').value); } catch (e) { /* 무시 */ } };
   window.addEventListener('online', netState); window.addEventListener('offline', netState); netState();
   try { db = await openDB(); } catch (e) { flash('앱 저장소를 열 수 없습니다(개인정보 보호 모드인지 확인): ' + e.message, 'err'); return; }
   storageCheck();
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch((e) => flash('오프라인 실행 준비 실패: ' + e.message, 'err'));
+  if ('serviceWorker' in navigator) {
+    const hadController = !!navigator.serviceWorker.controller;
+    navigator.serviceWorker.register('sw.js').catch((e) => flash('오프라인 실행 준비 실패: ' + e.message, 'err'));
+    // 새 버전이 설치되면 알림. 저장 중일 수 있으므로 자동 새로고침하지 않고 사용자가 누르게 함
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (!hadController) return;
+      const b = $('updateBar'); b.classList.remove('hidden');
+    });
+  }
   let openId = ''; try { openId = localStorage.getItem('dada.open') || ''; } catch (e) { /* 무시 */ }
   if (openId) { await openRecord(openId); try { const d = localStorage.getItem('dada.draft.' + openId); if (d) $('noteText').value = d; } catch (e) { /* 무시 */ } }
   else await renderHome();
