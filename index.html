@@ -20,6 +20,11 @@ h2{font-size:17px;margin:0 0 10px}
 label{display:block;font-size:14px;color:var(--muted);margin:8px 0 4px}
 input[type=text],input[type=date],textarea,select{width:100%;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink)}
 textarea{min-height:88px}
+input[type=text],input[type=date],select{height:46px}
+/* iOS Safari 날짜 칸: 기본 모양을 끄고 다른 칸과 같은 크기·왼쪽 정렬로 */
+input[type=date]{-webkit-appearance:none;appearance:none;display:block;min-width:0;max-width:100%;line-height:24px;text-align:left}
+input[type=date]::-webkit-date-and-time-value{text-align:left;margin:0;min-height:24px}
+input[type=date]::-webkit-calendar-picker-indicator{margin:0}
 button,.btn{display:block;width:100%;font:inherit;font-weight:600;padding:13px;border-radius:12px;border:0;background:var(--brand);color:#fff;margin-top:10px;text-align:center}
 button.secondary{background:#e9e1d1;color:var(--ink)}
 button.accent{background:var(--accent)}
