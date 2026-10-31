@@ -1,6 +1,6 @@
 'use strict';
 // 다다 기록 v0.1 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.3.1';
 const SCHEMA_VERSION = 1;
 const $ = (id) => document.getElementById(id);
 
@@ -82,8 +82,17 @@ async function storageCheck() {
   if (!navigator.storage) { box.textContent = '이 브라우저는 저장공간 상태를 알려주지 않습니다. 기록 후 자주 내보내기를 하세요.'; box.classList.remove('hidden'); return; }
   let persisted = false;
   try { persisted = await navigator.storage.persisted(); if (!persisted && navigator.storage.persist) persisted = await navigator.storage.persist(); } catch (e) { /* 무시 */ }
+  // 아이폰 Safari의 estimate() 사용량은 실제와 크게 다를 수 있어, 앱이 저장한 사진 크기를 직접 합산해 보여 줌
   let est = '';
-  try { const e = await navigator.storage.estimate(); est = ` 사용 ${fmtMB(e.usage || 0)} / 허용 약 ${fmtMB(e.quota || 0)}`; } catch (e) { /* 무시 */ }
+  try {
+    const [photos, recs] = await Promise.all([getAll('photos'), getAll('records')]);
+    const trashIds = new Set(recs.filter((r) => r.trashedAt).map((r) => r.id));
+    const total = photos.reduce((s, p) => s + p.size, 0);
+    const inTrash = photos.filter((p) => trashIds.has(p.recordId)).reduce((s, p) => s + p.size, 0);
+    est = ` 앱 안 사진 ${photos.length}장 · ${fmtMB(total)}${inTrash ? ` (휴지통 ${fmtMB(inTrash)} 포함 — 완전 삭제해야 공간이 비워짐)` : ''}`;
+    const e = await navigator.storage.estimate();
+    if (e.quota) est += ` · 기기 허용 한도 약 ${(e.quota / 1073741824).toFixed(1)}GB`;
+  } catch (e) { /* 무시 */ }
   box.textContent = (persisted ? '영구 저장 허용됨.' : '영구 저장이 허용되지 않았습니다. 사이트 데이터 삭제 시 앱 안 기록이 사라질 수 있으니, 방문이 끝날 때마다 내보내기로 파일 사본을 남기세요.') + est;
   box.className = 'msg ' + (persisted ? 'ok' : 'err');
 }
@@ -125,7 +134,7 @@ async function renderTrash(trash) {
     li.querySelector('strong').textContent = `${r.date} · ${r.place}`;
     li.querySelector('.status').textContent = `사진 ${photos.length}장 · 메모 ${r.notes.length}개 · 휴지통으로 옮긴 시각 ${localStr(r.trashedAt)}${r.exports.length ? '' : ' · 한 번도 내보내지 않음'}`;
     const rb = document.createElement('button'); rb.className = 'secondary'; rb.textContent = '복구';
-    rb.onclick = async () => { delete r.trashedAt; r.log.push({ type: 'restored', at: nowISO() }); await putRecord(r); flash(`'${r.place}' 기록을 복구했습니다.`, 'ok'); renderHome(); };
+    rb.onclick = async () => { delete r.trashedAt; r.log.push({ type: 'restored', at: nowISO() }); await putRecord(r); flash(`'${r.place}' 기록을 복구했습니다.`, 'ok'); renderHome(); storageCheck(); };
     const db_ = document.createElement('button'); db_.className = 'danger'; db_.textContent = '완전 삭제';
     db_.onclick = () => purgeRecord(r, photos.length);
     li.querySelector('.row').append(rb, db_); ul.appendChild(li);
@@ -142,7 +151,7 @@ async function purgeRecord(r, count) {
       t.objectStore('records').delete(r.id);
     });
     try { localStorage.removeItem('dada.draft.' + r.id); } catch (e) { /* 무시 */ }
-    await renderHome(); flash(`'${r.place}' 기록을 완전히 지웠습니다.`, 'ok');
+    await renderHome(); storageCheck(); flash(`'${r.place}' 기록을 완전히 지웠습니다.`, 'ok');
   } catch (e) { flash('삭제하지 못했습니다(자료는 그대로입니다): ' + e.message, 'err'); }
 }
 
@@ -153,7 +162,7 @@ async function trashRecord() {
   if (!confirm(`'${r.place}' 기록(사진 ${photos.length}장, 메모 ${r.notes.length}개)을 휴지통으로 옮길까요?\n휴지통에서 복구할 수 있습니다.${unexported}`)) return;
   r.trashedAt = nowISO(); r.log.push({ type: 'trashed', at: r.trashedAt });
   try { await putRecord(r); } catch (e) { delete r.trashedAt; flash('옮기지 못했습니다: ' + e.message, 'err'); return; }
-  current = null; await renderHome(); flash(`'${r.place}' 기록을 휴지통으로 옮겼습니다. 목록 아래 휴지통에서 복구할 수 있습니다.`, 'ok');
+  current = null; await renderHome(); storageCheck(); flash(`'${r.place}' 기록을 휴지통으로 옮겼습니다. 목록 아래 휴지통에서 복구할 수 있습니다.`, 'ok');
 }
 
 async function deletePhoto(p) {
@@ -164,7 +173,7 @@ async function deletePhoto(p) {
   for (const n of current.notes) n.photoIds = n.photoIds.filter((id) => id !== p.id);
   lastBatch = lastBatch.filter((id) => id !== p.id);
   current.log.push({ type: 'photo_removed', at: nowISO(), name: p.originalName, sha256: p.sha256, seq: p.seq });
-  await touch(); flash(`${String(p.seq).padStart(3, '0')}번 사진을 지웠습니다.`, 'ok'); await renderRecord();
+  await touch(); flash(`${String(p.seq).padStart(3, '0')}번 사진을 지웠습니다.`, 'ok'); await renderRecord(); storageCheck();
 }
 
 async function deleteNote(n) {
@@ -242,7 +251,7 @@ async function renderRecord() {
   const nl = $('noteList'); nl.innerHTML = '';
   for (const n of r.notes) {
     const li = document.createElement('li');
-    li.textContent = `[${hhmm(n.at)}] ${n.text}`;
+    const tx_ = document.createElement('div'); tx_.textContent = `[${hhmm(n.at)}] ${n.text}`; li.appendChild(tx_);
     if (n.photoIds.length) { const s = document.createElement('div'); s.className = 'status';
       s.textContent = '연결 사진: ' + n.photoIds.map((id) => { const p = photos.find((x) => x.id === id); return p ? String(p.seq).padStart(3, '0') : '?'; }).join(', '); li.appendChild(s); }
     const del = document.createElement('button'); del.className = 'link-del'; del.type = 'button'; del.textContent = '메모 지우기'; del.onclick = () => deleteNote(n); li.appendChild(del);
@@ -304,7 +313,7 @@ async function addFiles(fileList) {
   const odd = saved.filter((p) => !p.formatOk || p.kind !== 'jpeg' && p.kind !== 'heic' && p.kind !== 'png');
   if (odd.length) text += ` 참고: ${odd.map((p) => `${p.originalName}=${p.kind}`).join(', ')}`;
   flash(text, failed.length ? 'err' : 'ok');
-  await renderRecord();
+  await renderRecord(); storageCheck();
 }
 
 async function saveNote() {
