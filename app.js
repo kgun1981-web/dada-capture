@@ -1,6 +1,6 @@
 'use strict';
 // 다다 기록 v0.1 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
-const APP_VERSION = '0.5.1';
+const APP_VERSION = '0.5.2';
 const HASH_VERSION = 2; // content_hash 규칙 버전 (2: 사진 설명·촬영 시각 포함)
 const TAGS = ['맛', '가격', '분위기', '주차', '팁', '확인 필요'];
 const SCHEMA_VERSION = 1;
@@ -43,6 +43,16 @@ const getOne = (store, key) => tx([store], 'readonly', (t) => {
   const r = t.objectStore(store).get(key); const box = {}; r.onsuccess = () => { box.v = r.result; }; return box;
 }).then((b) => b.v);
 const putRecord = (rec) => tx(['records'], 'readwrite', (t) => { t.objectStore('records').put(rec); });
+// 저장소의 최신 기록을 한 트랜잭션 안에서 읽어 고친 뒤 저장. 화면 이동·동시 작업 중에도 다른 변경을 덮어쓰지 않음
+async function mutate(id, fn) {
+  const box = {};
+  await tx(['records'], 'readwrite', (t) => {
+    const st = t.objectStore('records'); const g = st.get(id);
+    g.onsuccess = () => { const rec = g.result; if (!rec) { box.err = new Error('기록을 찾지 못했습니다'); t.abort(); return; } fn(rec); st.put(rec); box.rec = rec; };
+  }).catch((e) => { throw box.err || e; });
+  if (current && current.id === id) current = box.rec;
+  return box.rec;
+}
 
 /* ---------- 도구 ---------- */
 function hex(buf) { return Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, '0')).join(''); }
@@ -54,6 +64,7 @@ function safeName(s, max = 60) {
   n = n.replace(/^[.\s]+/, '').replace(/[.\s]+$/, '');
   if (/^(con|prn|aux|nul|com[0-9]|lpt[0-9])(\.|$)/i.test(n)) n = '_' + n;
   if (n.length > max) { const ext = (n.match(/\.[A-Za-z0-9]{1,5}$/) || [''])[0]; n = n.slice(0, max - ext.length) + ext; }
+  n = n.replace(/[.\s]+$/, ''); // 자른 뒤 끝에 남은 점·공백도 제거(Windows에서 거부되는 이름 방지)
   return n || 'file';
 }
 function fmtMB(n) { return (n / 1048576).toFixed(1) + 'MB'; }
@@ -149,15 +160,20 @@ function exportState(r, photoCount) {
   return { key: 'ok', text: `내보냄 ${localStr(last)}`, cls: 'ok' };
 }
 
+let homeToken = 0, recToken = 0;
 async function renderHome() {
+  const tok = ++homeToken;
   $('viewHome').classList.remove('hidden'); $('viewRecord').classList.add('hidden'); $('flash').innerHTML = '';
   const all = (await getAll('records')).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  if (tok !== homeToken) return;
   const recs = all.filter((r) => !r.trashedAt), trash = all.filter((r) => r.trashedAt);
   const ul = $('recordList'); ul.innerHTML = ''; const pending = [];
   if (!recs.length) { ul.innerHTML = '<li class="status">아직 기록이 없습니다.</li>'; }
-  renderTrash(trash); renderDayCard(recs);
+  const counts = {}; for (const p of await getAll('photos')) counts[p.recordId] = (counts[p.recordId] || 0) + 1;
+  if (tok !== homeToken) return;
+  renderTrash(trash, counts); renderDayCard(recs);
   for (const r of recs) {
-    const photos = await getAll('photos', 'byRecord', r.id);
+    const photos = { length: counts[r.id] || 0 };
     const li = document.createElement('li');
     li.innerHTML = `<strong></strong><div class="status"></div>`;
     li.querySelector('strong').textContent = `${r.date} · ${r.place}`;
@@ -174,17 +190,17 @@ async function renderHome() {
   try { localStorage.setItem('dada.open', ''); } catch (e) { /* 무시 */ }
 }
 
-async function renderTrash(trash) {
+function renderTrash(trash, counts) {
   const box = $('trashCard'), ul = $('trashList');
   box.classList.toggle('hidden', !trash.length); ul.innerHTML = '';
   for (const r of trash) {
-    const photos = await getAll('photos', 'byRecord', r.id);
+    const photos = { length: counts[r.id] || 0 };
     const li = document.createElement('li');
     li.innerHTML = '<strong></strong><div class="status"></div><div class="row"></div>';
     li.querySelector('strong').textContent = `${r.date} · ${r.place}`;
     li.querySelector('.status').textContent = `사진 ${photos.length}장 · 메모 ${r.notes.length}개 · 휴지통으로 옮긴 시각 ${localStr(r.trashedAt)}${r.exports.length ? '' : ' · 한 번도 내보내지 않음'}`;
     const rb = document.createElement('button'); rb.className = 'secondary'; rb.textContent = '복구';
-    rb.onclick = async () => { delete r.trashedAt; r.log.push({ type: 'restored', at: nowISO() }); await putRecord(r); flash(`'${r.place}' 기록을 복구했습니다.`, 'ok'); renderHome(); storageCheck(); };
+    rb.onclick = async () => { try { await mutate(r.id, (x) => { delete x.trashedAt; x.log.push({ type: 'restored', at: nowISO() }); }); } catch (e) { flash('복구하지 못했습니다: ' + e.message, 'err'); return; } flash(`'${r.place}' 기록을 복구했습니다.`, 'ok'); renderHome(); storageCheck(); };
     const db_ = document.createElement('button'); db_.className = 'danger'; db_.textContent = '완전 삭제';
     db_.onclick = () => purgeRecord(r, photos.length);
     li.querySelector('.row').append(rb, db_); ul.appendChild(li);
@@ -210,8 +226,7 @@ async function trashRecord() {
   const lastExport = r.exports.length ? r.exports[r.exports.length - 1].at : null;
   const unexported = !lastExport ? '\n\n이 기록은 아직 내보내지 않았습니다.' : (r.updatedAt && r.updatedAt > lastExport ? '\n\n마지막 내보내기 뒤에 바뀐 내용이 있습니다.' : '');
   if (!confirm(`'${r.place}' 기록(사진 ${photos.length}장, 메모 ${r.notes.length}개)을 휴지통으로 옮길까요?\n휴지통에서 복구할 수 있습니다.${unexported}`)) return;
-  r.trashedAt = nowISO(); r.log.push({ type: 'trashed', at: r.trashedAt });
-  try { await putRecord(r); } catch (e) { delete r.trashedAt; flash('옮기지 못했습니다: ' + e.message, 'err'); return; }
+  try { const at = nowISO(); await mutate(r.id, (x) => { x.trashedAt = at; x.log.push({ type: 'trashed', at }); }); } catch (e) { flash('옮기지 못했습니다: ' + e.message, 'err'); return; }
   current = null; await renderHome(); storageCheck(); flash(`'${r.place}' 기록을 휴지통으로 옮겼습니다. 목록 아래 휴지통에서 복구할 수 있습니다.`, 'ok');
 }
 
@@ -220,22 +235,22 @@ async function deletePhoto(p) {
   try {
     await tx(['photos', 'blobs'], 'readwrite', (t) => { t.objectStore('blobs').delete(p.id); t.objectStore('photos').delete(p.id); });
   } catch (e) { flash('사진을 지우지 못했습니다: ' + e.message, 'err'); return; }
-  for (const n of current.notes) n.photoIds = n.photoIds.filter((id) => id !== p.id);
   lastBatch = lastBatch.filter((id) => id !== p.id);
-  current.log.push({ type: 'photo_removed', at: nowISO(), name: p.originalName, sha256: p.sha256, seq: p.seq });
-  await touch(); flash(`${String(p.seq).padStart(3, '0')}번 사진을 지웠습니다.`, 'ok'); await renderRecord(); storageCheck();
+  const at = nowISO();
+  await mutate(p.recordId, (x) => { for (const n of x.notes) n.photoIds = n.photoIds.filter((id) => id !== p.id); x.log.push({ type: 'photo_removed', at, name: p.originalName, sha256: p.sha256, seq: p.seq }); x.updatedAt = at; });
+  flash(`${String(p.seq).padStart(3, '0')}번 사진을 지웠습니다.`, 'ok'); await renderRecord(); storageCheck();
 }
 
 async function deleteNote(n) {
   const short = n.text.length > 40 ? n.text.slice(0, 40) + '…' : n.text;
   if (!confirm(`이 메모를 지울까요?\n\n"${short}"\n\n되돌릴 수 없습니다.`)) return;
-  const idx = current.notes.indexOf(n); current.notes.splice(idx, 1);
-  current.log.push({ type: 'note_removed', at: nowISO(), note_id: n.id });
-  try { await touch(); } catch (e) { current.notes.splice(idx, 0, n); current.log.pop(); flash('메모를 지우지 못했습니다: ' + e.message, 'err'); return; }
+  const at = nowISO();
+  try { await mutate(current.id, (x) => { x.notes = x.notes.filter((m) => m.id !== n.id); x.log.push({ type: 'note_removed', at, note_id: n.id }); x.updatedAt = at; }); }
+  catch (e) { flash('메모를 지우지 못했습니다: ' + e.message, 'err'); return; }
   flash('메모를 지웠습니다.', 'ok'); await renderRecord();
 }
 
-async function touch() { current.updatedAt = nowISO(); await putRecord(current); }
+async function touch(id = current && current.id) { const at = nowISO(); await mutate(id, (x) => { x.updatedAt = at; }); }
 
 /* ---------- 하루 일정 요약 MD ---------- */
 async function renderDayCard(recs) {
@@ -285,12 +300,12 @@ async function makeDaySummary() {
     const sh = document.createElement('button'); sh.textContent = '공유';
     sh.onclick = async () => {
       let ok = false; try { ok = !!(navigator.canShare && navigator.canShare({ files: [f] })); } catch (e) { /* 무시 */ }
-      if (!ok) { flash('이 기기에서는 공유 시트로 넘길 수 없습니다. "파일로 저장"을 쓰세요.', 'err'); return; }
-      try { await navigator.share({ files: [f], title: f.name }); } catch (e) { if (e.name !== 'AbortError') flash('공유 실패: ' + e.message, 'err'); }
+      if (!ok) { m.className = 'msg err'; m.textContent = '이 기기에서는 공유 시트로 넘길 수 없습니다. "파일로 저장"을 쓰세요.'; return; }
+      try { await navigator.share({ files: [f], title: f.name }); m.className = 'msg ok'; m.textContent = `${f.name}을(를) 공유 시트로 넘겼습니다.`; } catch (e) { if (e.name !== 'AbortError') { m.className = 'msg err'; m.textContent = '공유 실패: ' + e.message; } }
     };
     const a = document.createElement('a'); a.className = 'btn'; a.style.background = '#e9e1d1'; a.style.color = '#1d2522'; a.href = URL.createObjectURL(f); a.download = f.name; a.textContent = '파일로 저장 (다운로드)';
     out.append(sh, a);
-  } catch (e) { flash('요약을 만들지 못했습니다: ' + e.message, 'err'); }
+  } catch (e) { const m = document.createElement('div'); m.className = 'msg err'; m.textContent = '요약을 만들지 못했습니다: ' + e.message; out.appendChild(m); }
 }
 
 async function startRecord() {
@@ -313,8 +328,9 @@ async function openRecord(id) {
 }
 
 async function renderRecord() {
-  const r = current;
+  const tok = ++recToken; const r = current; if (!r) return;
   const photos = (await getAll('photos', 'byRecord', r.id)).sort((a, b) => a.seq - b.seq);
+  if (tok !== recToken || current !== r) return;
   $('recTitle').textContent = `${r.place}${r.topic ? ' — ' + r.topic : ''}`;
   $('recMeta').textContent = `${r.date} · 기록번호 ${r.id}`;
   const total = photos.reduce((s, p) => s + p.size, 0);
@@ -335,6 +351,9 @@ async function renderRecord() {
   $('noteLinkLabel').textContent = lastBatch.length ? `방금 추가한 사진 ${lastBatch.length}장과 연결` : '방금 추가한 사진과 연결 (추가한 사진 없음)';
   $('noteLink').disabled = !lastBatch.length; if (!lastBatch.length) $('noteLink').checked = false;
 
+  const blobs = {};
+  for (const p of photos) if (['jpeg', 'png', 'webp', 'gif', 'heic'].includes(p.kind)) blobs[p.id] = await getOne('blobs', p.id);
+  if (tok !== recToken || current !== r) return;
   const th = $('thumbs');
   th.querySelectorAll('img').forEach((i) => URL.revokeObjectURL(i.src));
   th.innerHTML = '';
@@ -342,7 +361,7 @@ async function renderRecord() {
     const d = document.createElement('div');
     d.title = p.originalName;
     if (['jpeg', 'png', 'webp', 'gif', 'heic'].includes(p.kind)) {
-      const blob = await getOne('blobs', p.id);
+      const blob = blobs[p.id];
       const img = document.createElement('img'); img.alt = p.originalName; img.loading = 'lazy';
       img.onerror = () => { img.remove(); d.prepend(document.createTextNode(`${String(p.seq).padStart(3, '0')} ${p.kind.toUpperCase()}`)); };
       if (blob) img.src = URL.createObjectURL(blob);
@@ -384,7 +403,8 @@ async function addFiles(fileList) {
   if (!files.length) return;
   if (!current) { flash(`기록이 아직 열리지 않아 사진 ${files.length}장을 저장하지 않았습니다. 기록을 연 뒤 다시 고르세요.`, 'err'); return; }
   const prog = $('progress');
-  const existing = await getAll('photos', 'byRecord', current.id);
+  const rid = current.id, logs = []; // 저장 도중 다른 화면으로 가도 이 기록에만 저장
+  const existing = await getAll('photos', 'byRecord', rid);
   let seq = existing.reduce((m, p) => Math.max(m, p.seq), 0);
   const saved = [], skipped = [], failed = [];
   lastBatch = [];
@@ -397,12 +417,12 @@ async function addFiles(fileList) {
       if (buf.byteLength !== f.size) throw new Error('파일을 끝까지 읽지 못함');
       const digest = await sha256(buf);
       const same = await getAll('photos', 'bySha', digest);
-      const inThis = same.find((p) => p.recordId === current.id);
-      if (inThis) { skipped.push(`${f.name} (=${String(inThis.seq).padStart(3, '0')}번)`); current.log.push({ type: 'duplicate_skipped', at: nowISO(), name: f.name, sha256: digest, same_as: inThis.id }); continue; }
+      const inThis = same.find((p) => p.recordId === rid);
+      if (inThis) { skipped.push(`${f.name} (=${String(inThis.seq).padStart(3, '0')}번)`); logs.push({ type: 'duplicate_skipped', at: nowISO(), name: f.name, sha256: digest, same_as: inThis.id }); continue; }
       const det = detectKind(new Uint8Array(buf, 0, Math.min(32, buf.byteLength)));
       const ex = det.kind === 'jpeg' ? readExif(new Uint8Array(buf, 0, Math.min(262144, buf.byteLength))) : { takenAt: null, takenOffset: null, hasGps: false, read: false };
       const photo = {
-        id: digest.slice(0, 16) + '-' + current.id, recordId: current.id, seq: ++seq,
+        id: digest.slice(0, 16) + '-' + rid, recordId: rid, seq: ++seq,
         originalName: f.name || `photo_${seq}`, mime: f.type || '', size: buf.byteLength, sha256: digest,
         lastModified: f.lastModified ? new Date(f.lastModified).toISOString() : null,
         addedAt: nowISO(), kind: det.kind, formatOk: det.ok, formatNote: det.note || '',
@@ -422,12 +442,13 @@ async function addFiles(fileList) {
       saved.push(photo); lastBatch.push(photo.id);
     } catch (e) {
       const msg = (e && e.name === 'QuotaExceededError') ? '저장공간 부족' : (e.message || String(e));
-      failed.push(`${f.name}: ${msg}`); current.log.push({ type: 'save_failed', at: nowISO(), name: f.name, error: msg });
+      failed.push(`${f.name}: ${msg}`); logs.push({ type: 'save_failed', at: nowISO(), name: f.name, error: msg });
     }
   }
-  if (saved.length) current.updatedAt = nowISO();
-  try { await putRecord(current); } catch (e) { failed.push('기록 정보 갱신 실패: ' + e.message); }
+  try { const at = nowISO(); await mutate(rid, (x) => { x.log.push(...logs); if (saved.length) x.updatedAt = at; }); }
+  catch (e) { failed.push('기록 정보 갱신 실패(사진은 저장됨): ' + e.message); }
   prog.textContent = '';
+  if (!current || current.id !== rid) { flash(`이전 기록에 사진 ${saved.length}장 저장을 마쳤습니다${failed.length ? ` (실패 ${failed.length}건 — 그 기록을 열어 확인하세요)` : ''}.`, failed.length ? 'err' : 'ok'); if (!current) renderHome(); storageCheck(); return; }
   let text = `저장됨 ${saved.length}장.`;
   if (skipped.length) text += ` 이미 있는 같은 사진이라 건너뜀 ${skipped.length}장: ${skipped.join(', ')}.`;
   if (failed.length) text += ` 저장 실패 ${failed.length}건(앱에 없음, 다시 시도 필요): ${failed.join(' / ')}`;
@@ -447,7 +468,7 @@ async function editCaption(p) {
   const v = prompt(`${String(p.seq).padStart(3, '0')}번 사진 한 줄 설명 (예: 첨성대 정면, 해 질 무렵)`, p.caption || '');
   if (v === null) return;
   const old = p.caption; p.caption = v.trim().slice(0, 200);
-  try { await tx(['photos'], 'readwrite', (t) => { t.objectStore('photos').put(p); }); await touch(); }
+  try { await tx(['photos'], 'readwrite', (t) => { t.objectStore('photos').put(p); }); await touch(p.recordId); }
   catch (e) { p.caption = old; flash('설명을 저장하지 못했습니다: ' + e.message, 'err'); return; }
   flash(p.caption ? `${String(p.seq).padStart(3, '0')}번 사진 설명 저장됨.` : '설명을 지웠습니다.', 'ok'); await renderRecord();
 }
@@ -461,17 +482,18 @@ async function saveNote() {
   const text = $('noteText').value.trim();
   if (!text) { flash('메모 내용을 입력하세요.', 'err'); return; }
   if (editingNote) {
-    const n = editingNote, oldText = n.text, oldEd = n.editedAt;
-    if (text === oldText) { endEditNote(); return; }
-    n.text = text; n.editedAt = nowISO(); current.updatedAt = n.editedAt;
-    current.log.push({ type: 'note_edited', at: n.editedAt, note_id: n.id });
-    try { await putRecord(current); } catch (e) { n.text = oldText; n.editedAt = oldEd; current.log.pop(); flash('고친 메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
+    const n = editingNote;
+    if (text === n.text) { endEditNote(); return; }
+    const at = nowISO(); let found = false;
+    try { await mutate(current.id, (x) => { const m = x.notes.find((y) => y.id === n.id); if (!m) return; found = true; m.text = text; m.editedAt = at; x.updatedAt = at; x.log.push({ type: 'note_edited', at, note_id: n.id }); }); }
+    catch (e) { flash('고친 메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
+    if (!found) { flash('고치려던 메모가 이미 지워졌습니다. 입력 내용은 그대로 두었으니 새 메모로 저장하려면 "고치기 취소" 후 다시 붙여 넣으세요.', 'err'); return; }
     endEditNote(); try { localStorage.removeItem('dada.draft.' + current.id); } catch (e) { /* 무시 */ }
     flash('메모를 고쳤습니다.', 'ok'); await renderRecord(); return;
   }
   const note = { id: 'n' + Date.now().toString(36), at: nowISO(), text, photoIds: $('noteLink').checked ? [...lastBatch] : [] };
-  current.notes.push(note); current.updatedAt = nowISO();
-  try { await putRecord(current); } catch (e) { current.notes.pop(); flash('메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
+  try { await mutate(current.id, (x) => { x.notes.push(note); x.updatedAt = note.at; }); }
+  catch (e) { flash('메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
   $('noteText').value = ''; $('noteLink').checked = false;
   try { localStorage.removeItem('dada.draft.' + current.id); } catch (e) { /* 무시 */ }
   flash('메모 저장됨.', 'ok');
@@ -480,8 +502,8 @@ async function saveNote() {
 
 async function finishRecord() {
   if (current.endedAt) { flash('이미 끝난 기록입니다. 사진·메모는 계속 추가할 수 있습니다.', 'info'); return; }
-  current.endedAt = nowISO(); current.updatedAt = current.endedAt;
-  try { await putRecord(current); } catch (e) { current.endedAt = null; flash('저장 실패: ' + e.message, 'err'); return; }
+  const at = nowISO();
+  try { await mutate(current.id, (x) => { if (!x.endedAt) { x.endedAt = at; x.updatedAt = at; } }); } catch (e) { flash('저장 실패: ' + e.message, 'err'); return; }
   const photos = await getAll('photos', 'byRecord', current.id);
   flash(`기록 끝. 사진 ${photos.length}장, 메모 ${current.notes.length}개입니다. 내보내기 전에 개수를 확인하세요.`, 'ok');
   await renderRecord();
@@ -538,7 +560,7 @@ function notesMarkdown(r, photos, fileOf, partOf = {}, parts = 1) {
   L.push('## 메모 (시간순)', '');
   if (!r.notes.length) L.push('(메모 없음)', '');
   r.notes.forEach((n, i) => {
-    L.push(`### ${i + 1}. ${hhmm(n.at)}${n.editedAt ? ` (고침 ${hhmm(n.editedAt)})` : ''}`, '', n.text, '');
+    L.push(`### ${i + 1}. ${hhmm(n.at)}${n.editedAt ? ` (고침 ${hhmm(n.editedAt)})` : ''}`, '', n.text.split(/\r?\n/).map((l) => '> ' + l).join('\n'), ''); // 인용으로 감싸 메모 속 '#' 등이 문서 구조를 깨지 않게
     const linked = n.photoIds.map((id) => fileOf[id]).filter(Boolean);
     if (linked.length) L.push('연결 사진: ' + linked.map((f) => '`' + f + '`').join(', '), '');
   });
@@ -574,8 +596,9 @@ function notesText(r, photos, fileOf) {
 async function exportRecord() {
   const out = $('exportOut'); out.innerHTML = '';
   const btn = $('btnExport'); btn.disabled = true;
+  const rid0 = current.id;
   try {
-    const r = current;
+    const r = await getOne('records', rid0); // 저장소의 최신 내용으로 내보냄
     const photos = (await getAll('photos', 'byRecord', r.id)).sort((a, b) => a.seq - b.seq);
     if (!photos.length && !r.notes.length) throw new Error('내보낼 사진과 메모가 없습니다.');
     const limit = Number($('splitSel').value) * 1048576;
@@ -650,22 +673,21 @@ async function exportRecord() {
       if (limit && zip.size > limit) oversize.push(`${zname} ${fmtMB(zip.size)} (사진 한 장이 한도보다 큼)`);
     }
     $('progress').textContent = '';
-    r.exports.push({ at: exportedAt, parts: results.length, bytes: results.reduce((s, f) => s + f.size, 0) });
-    await putRecord(r);
-    showExport(results, photos, fileOf, oversize);
+    await mutate(r.id, (x) => { x.exports.push({ at: exportedAt, parts: results.length, bytes: results.reduce((s, f) => s + f.size, 0), content_hash: contentHash }); });
+    if (!current || current.id !== r.id) { flash(`'${r.place}' 내보내기 묶음을 만들었지만 화면을 옮겨 공유 버튼을 보여 줄 수 없습니다. 그 기록을 열어 다시 '내보내기 묶음 만들기'를 누르세요.`, 'info'); return; }
+    showExport(results, photos, fileOf, oversize, r);
     await renderRecord();
   } catch (e) {
     $('progress').textContent = '';
     flash('내보내기 실패: ' + (e.message || e) + ' (앱 안 원본은 지우지 않았습니다)', 'err');
-    current.log.push({ type: 'export_failed', at: nowISO(), error: String(e.message || e) });
-    try { await putRecord(current); } catch (e2) { /* 무시 */ }
+    try { const at = nowISO(); await mutate(rid0, (x) => { x.log.push({ type: 'export_failed', at, error: String(e.message || e) }); }); } catch (e2) { /* 무시 */ }
   } finally { btn.disabled = false; }
 }
 
-function showExport(files, photos, fileOf, oversize = []) {
+function showExport(files, photos, fileOf, oversize = [], rec = current) {
   const out = $('exportOut'); out.innerHTML = '';
   const m = document.createElement('div'); m.className = 'msg ok';
-  m.textContent = `묶음 ${files.length}개 준비됨 (사진 ${photos.length}장, 메모 ${current.notes.length}개, 합계 ${fmtMB(files.reduce((s, f) => s + f.size, 0))}). 아직 어디에도 보내지 않았습니다.`;
+  m.textContent = `묶음 ${files.length}개 준비됨 (사진 ${photos.length}장, 메모 ${rec.notes.length}개, 합계 ${fmtMB(files.reduce((s, f) => s + f.size, 0))}). 아직 어디에도 보내지 않았습니다.`;
   out.appendChild(m);
   if (oversize.length) { const w = document.createElement('div'); w.className = 'msg err'; w.textContent = '선택한 크기보다 큰 묶음: ' + oversize.join(', ') + '. 이 묶음은 개별 공유를 쓰거나 그대로 시도하세요.'; out.appendChild(w); }
   // 내보내기 칸의 안내는 버튼 바로 위에 표시(화면 맨 위 안내는 스크롤하면 안 보임)
@@ -697,7 +719,7 @@ function showExport(files, photos, fileOf, oversize = []) {
     if (needWifi()) return;
     const list = [];
     for (const p of photos) { const b = await getOne('blobs', p.id); list.push(new File([b], fileOf[p.id].replace('photos/', ''), { type: p.mime || 'application/octet-stream' })); }
-    list.push(new File([notesMarkdown(current, photos, fileOf)], '기록.md', { type: 'text/markdown;charset=utf-8' }));
+    list.push(new File([notesMarkdown(rec, photos, fileOf)], '기록.md', { type: 'text/markdown;charset=utf-8' }));
     if (!canShare(list)) { say('한 번에 공유할 수 없는 크기·형식입니다. 묶음별 공유 버튼을 쓰세요.', 'err'); return; }
     try { await navigator.share({ files: list }); say('공유 시트로 넘겼습니다.', 'ok'); } catch (e) { say(e.name === 'AbortError' ? '공유 취소. 원본은 그대로입니다.' : '공유 실패: ' + e.message, 'err'); }
   };

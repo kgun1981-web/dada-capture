@@ -1,12 +1,16 @@
 // 앱 화면 파일만 캐시합니다. 사진·메모는 IndexedDB에만 있고 네트워크로 보내지 않습니다.
 // 배포할 때마다 VERSION을 올립니다. 같은 주소의 다른 앱 캐시는 건드리지 않도록 이 앱 접두어 캐시만 정리·조회합니다.
 const PREFIX = 'dada-capture-shell-';
-const VERSION = PREFIX + 'v9';
+const VERSION = PREFIX + 'v10';
 const SHELL = ['./', './index.html', './app.js', './manifest.webmanifest', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
   // cache:'reload' — 브라우저 HTTP 캐시에 남은 이전 버전 파일을 새 캐시에 넣지 않도록 항상 서버에서 새로 받음
-  event.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' })))).then(() => self.skipWaiting()));
+  // 새 버전 파일을 하나라도 못 받으면 반쯤 만든 캐시를 지우고 설치를 실패시킴 → 이전 버전이 그대로 동작
+  event.waitUntil(caches.open(VERSION)
+    .then((c) => c.addAll(SHELL.map((u) => new Request(u, { cache: 'reload' }))))
+    .then(() => self.skipWaiting())
+    .catch((e) => caches.delete(VERSION).then(() => { throw e; })));
 });
 
 self.addEventListener('activate', (event) => {
