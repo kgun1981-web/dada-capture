@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="다다 기록">
+<meta name="theme-color" content="#1f3a34">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-180.png">
+<title>다다 기록</title>
+<style>
+:root{--bg:#f6f1e7;--ink:#1d2522;--muted:#5d6a64;--card:#fffdf8;--line:#dcd3c2;--brand:#1f3a34;--accent:#c8693a;--ok:#2f6b4f;--warn:#a2401f}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Malgun Gothic",sans-serif;padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px)}
+header{display:flex;align-items:center;justify-content:space-between;padding:14px 0 8px}
+h1{font-size:22px;margin:0;color:var(--brand)}
+h2{font-size:17px;margin:0 0 10px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}
+label{display:block;font-size:14px;color:var(--muted);margin:8px 0 4px}
+input[type=text],input[type=date],textarea,select{width:100%;font:inherit;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:#fff;color:var(--ink)}
+textarea{min-height:88px}
+button,.btn{display:block;width:100%;font:inherit;font-weight:600;padding:13px;border-radius:12px;border:0;background:var(--brand);color:#fff;margin-top:10px;text-align:center}
+button.secondary{background:#e9e1d1;color:var(--ink)}
+button.accent{background:var(--accent)}
+button:disabled{opacity:.45}
+.row{display:flex;gap:8px}.row>*{flex:1}
+.status{font-size:13px;color:var(--muted)}
+.badge{display:inline-block;font-size:12px;padding:2px 8px;border-radius:99px;background:#e9e1d1;margin:2px 4px 2px 0}
+.badge.warn{background:#f6d8c8;color:var(--warn)}.badge.ok{background:#d6eadf;color:var(--ok)}
+.msg{padding:10px 12px;border-radius:10px;margin:10px 0;font-size:14px}
+.msg.err{background:#f6d8c8;color:var(--warn)}.msg.ok{background:#d6eadf;color:var(--ok)}.msg.info{background:#e9e1d1}
+ul.list{list-style:none;padding:0;margin:0}
+ul.list li{border-top:1px solid var(--line);padding:10px 0}
+ul.list li:first-child{border-top:0}
+.thumbs{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
+.thumbs div{aspect-ratio:1;border-radius:8px;background:#e9e1d1;overflow:hidden;font-size:11px;display:flex;align-items:center;justify-content:center;text-align:center;position:relative}
+.thumbs img{width:100%;height:100%;object-fit:cover}
+.thumbs .dup{position:absolute;inset:auto 0 0 0;background:rgba(162,64,31,.85);color:#fff}
+.hidden{display:none}
+.check{display:flex;gap:8px;align-items:flex-start;font-size:14px;margin-top:10px}
+.check input{margin-top:4px}
+</style>
+</head>
+<body>
+<header><h1>다다 기록</h1><span class="status" id="netState"></span></header>
+<div id="storageMsg" class="msg info hidden"></div>
+<div id="flash"></div>
+
+<section id="viewHome">
+  <div class="card">
+    <h2>새 기록 시작</h2>
+    <label for="fDate">날짜</label><input type="date" id="fDate">
+    <label for="fPlace">장소</label><input type="text" id="fPlace" placeholder="예: 경주 대릉원">
+    <label for="fTopic">주제</label><input type="text" id="fTopic" placeholder="예: 가을 산책">
+    <button id="btnStart">기록 시작</button>
+  </div>
+  <div class="card">
+    <h2>저장된 기록</h2>
+    <ul class="list" id="recordList"></ul>
+  </div>
+</section>
+
+<section id="viewRecord" class="hidden">
+  <div class="card">
+    <div class="status" id="recMeta"></div>
+    <h2 id="recTitle"></h2>
+    <div id="recBadges"></div>
+  </div>
+  <div class="card" id="captureCard">
+    <h2>사진 추가</h2>
+    <p class="status">사진 앱의 원본을 고르거나 바로 찍습니다. 저장이 끝나기 전에는 '저장됨'으로 표시하지 않습니다.</p>
+    <div class="row">
+      <label class="btn" for="inPick" style="color:#fff;margin-top:6px">사진 고르기</label>
+      <label class="btn" for="inShoot" style="color:#fff;margin-top:6px;background:var(--accent)">바로 찍기</label>
+    </div>
+    <input type="file" id="inPick" multiple accept="image/*,image/heic,image/heif,video/quicktime" class="hidden">
+    <input type="file" id="inShoot" accept="image/*" capture="environment" class="hidden">
+    <div id="progress" class="status"></div>
+  </div>
+  <div class="card" id="noteCard">
+    <h2>메모</h2>
+    <textarea id="noteText" placeholder="지금 느낀 점, 가격, 분위기 등"></textarea>
+    <label class="check"><input type="checkbox" id="noteLink"> <span id="noteLinkLabel">방금 추가한 사진과 연결</span></label>
+    <button id="btnNote">메모 저장</button>
+  </div>
+  <div class="card">
+    <h2>사진 <span id="photoCount"></span></h2>
+    <div class="thumbs" id="thumbs"></div>
+    <h2 style="margin-top:14px">메모 <span id="noteCount"></span></h2>
+    <ul class="list" id="noteList"></ul>
+  </div>
+  <div class="card">
+    <h2>마무리와 내보내기</h2>
+    <button class="secondary" id="btnFinish">기록 끝</button>
+    <label for="splitSel">묶음 크기 (실제 ZIP 크기 기준. 사진 한 장이 이보다 크면 그 묶음만 커집니다)</label>
+    <select id="splitSel">
+      <option value="50" selected>50MB씩 나누기 (기본)</option>
+      <option value="100">100MB씩 나누기</option>
+      <option value="0">한 묶음 (ZIP 1개)</option>
+    </select>
+    <label class="check"><input type="checkbox" id="wifiOk"> <span>Wi-Fi 연결을 직접 확인했습니다 (앱이 자동으로 확인하지 않습니다)</span></label>
+    <button class="accent" id="btnExport">내보내기 묶음 만들기</button>
+    <div id="exportOut"></div>
+    <p class="status">공유 시트에서 '파일에 저장' 또는 ChatGPT를 고릅니다. ChatGPT에 첨부하는 순간 파일이 그쪽 서버로 올라갑니다. 앱 안의 원본은 지우지 않습니다.</p>
+    <button class="secondary" id="btnBack">목록으로</button>
+  </div>
+</section>
+<script src="app.js"></script>
+</body>
+</html>
