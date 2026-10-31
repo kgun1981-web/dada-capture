@@ -42,11 +42,19 @@ ul.list li:first-child{border-top:0}
 .thumbs div{aspect-ratio:1;border-radius:8px;background:#e9e1d1;overflow:hidden;font-size:11px;display:flex;align-items:center;justify-content:center;text-align:center;position:relative}
 .thumbs img{width:100%;height:100%;object-fit:cover}
 .thumbs .dup{position:absolute;inset:auto 0 0 0;background:rgba(162,64,31,.85);color:#fff}
-.thumbs .tag{position:absolute;top:4px;left:4px;background:rgba(29,37,34,.75);color:#fff;font-size:10px;padding:1px 5px;border-radius:6px}
-.thumbs .del{position:absolute;top:2px;right:2px;width:30px;height:30px;margin:0;padding:0;border-radius:50%;background:rgba(29,37,34,.75);color:#fff;font-size:18px;line-height:30px}
+.thumbs .tag{position:absolute;top:4px;left:4px;max-width:calc(100% - 34px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;background:rgba(29,37,34,.75);color:#fff;font-size:10px;padding:1px 5px;border-radius:6px}
+.thumbs .gps{position:absolute;top:22px;left:4px;background:rgba(162,64,31,.85);color:#fff;font-size:10px;padding:1px 5px;border-radius:6px}
+.thumbs .del{position:absolute;top:2px;right:2px;width:28px;height:28px;margin:0;padding:0;border-radius:50%;background:rgba(29,37,34,.75);color:#fff;font-size:16px;line-height:28px}
 button.danger{background:#a2401f}
 .link-del{display:block;width:auto;background:none;color:var(--warn);font-size:13px;font-weight:500;padding:4px 0;margin:4px 0 0}
 #updateBar button{margin-top:6px}
+.thumbs .cap{position:absolute;left:0;right:0;bottom:0;background:rgba(29,37,34,.72);color:#fff;font-size:10px;padding:2px 4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.thumbs div{cursor:pointer}
+.note-actions{display:flex;gap:16px}
+.link-edit{display:block;width:auto;background:none;color:var(--brand);font-size:13px;font-weight:500;padding:4px 0;margin:4px 0 0}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px}
+button.chip{display:inline-block;width:auto;margin:0;padding:6px 12px;border-radius:99px;background:#e9e1d1;color:var(--ink);font-size:14px;font-weight:500}
+ul.small li{padding:6px 0;font-size:14px}
 .hidden{display:none}
 .check{display:flex;gap:8px;align-items:flex-start;font-size:14px;margin-top:10px}
 .check input{margin-top:4px}
@@ -57,6 +65,7 @@ button.danger{background:#a2401f}
 <div id="updateBar" class="msg info hidden">새 버전이 준비됐습니다. 저장이 끝난 뒤 눌러 주세요.<button class="secondary" onclick="location.reload()">새 버전 적용</button></div>
 <div id="storageMsg" class="msg info hidden"></div>
 <div id="flash"></div>
+<div id="pendingMsg" class="msg err hidden"></div>
 
 <section id="viewHome">
   <div class="card">
@@ -69,6 +78,13 @@ button.danger{background:#a2401f}
   <div class="card">
     <h2>저장된 기록</h2>
     <ul class="list" id="recordList"></ul>
+  </div>
+  <div class="card hidden" id="dayCard">
+    <h2>하루 일정 요약</h2>
+    <p class="status">그날 방문한 기록을 시간순으로 묶은 글 요약(MD)을 만듭니다. 사진은 들어 있지 않습니다.</p>
+    <select id="daySel"></select>
+    <button class="secondary" id="btnDay">요약 MD 만들기</button>
+    <div id="dayOut"></div>
   </div>
   <div class="card hidden" id="trashCard">
     <h2>휴지통</h2>
@@ -96,13 +112,17 @@ button.danger{background:#a2401f}
   </div>
   <div class="card" id="noteCard">
     <h2>메모</h2>
-    <textarea id="noteText" placeholder="지금 느낀 점, 가격, 분위기 등"></textarea>
+    <div class="chips" id="tagChips"></div>
+    <textarea id="noteText" placeholder="지금 느낀 점, 가격, 분위기 등 (키보드 마이크로 말해서 입력 가능)"></textarea>
     <label class="check"><input type="checkbox" id="noteLink"> <span id="noteLinkLabel">방금 추가한 사진과 연결</span></label>
     <button id="btnNote">메모 저장</button>
+    <button class="secondary hidden" id="btnNoteCancel">고치기 취소</button>
   </div>
   <div class="card">
     <h2>사진 <span id="photoCount"></span></h2>
     <div class="thumbs" id="thumbs"></div>
+    <p class="status">사진을 누르면 한 줄 설명을 적을 수 있습니다.</p>
+    <ul class="list small" id="captionList"></ul>
     <h2 style="margin-top:14px">메모 <span id="noteCount"></span></h2>
     <ul class="list" id="noteList"></ul>
   </div>

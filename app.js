@@ -1,6 +1,8 @@
 'use strict';
 // 다다 기록 v0.1 — 오프라인 현장 기록. 외부 전송 코드 없음(공유는 사용자가 공유 시트에서 직접 선택).
-const APP_VERSION = '0.4.0';
+const APP_VERSION = '0.5.0';
+const HASH_VERSION = 2; // content_hash 규칙 버전 (2: 사진 설명·촬영 시각 포함)
+const TAGS = ['맛', '가격', '분위기', '주차', '팁', '확인 필요'];
 const SCHEMA_VERSION = 1;
 const $ = (id) => document.getElementById(id);
 
@@ -76,6 +78,38 @@ function detectKind(u8) {
   return { kind: 'unknown', ok: false, note: '형식 확인 필요 — 원본 그대로 보관·내보내기' };
 }
 
+/* ---------- 사진 정보(EXIF): 촬영 시각·위치정보 유무. JPEG만 읽음 ---------- */
+function readExif(u8) {
+  const out = { takenAt: null, takenOffset: null, hasGps: false, read: false };
+  try {
+    if (!(u8[0] === 0xff && u8[1] === 0xd8)) return out;
+    let i = 2;
+    while (i + 4 < u8.length) {
+      if (u8[i] !== 0xff) break;
+      const m = u8[i + 1], len = (u8[i + 2] << 8) | u8[i + 3];
+      if (m === 0xda || m === 0xd9) break;
+      if (m === 0xe1 && String.fromCharCode(...u8.slice(i + 4, i + 8)) === 'Exif' && u8[i + 8] === 0 && u8[i + 9] === 0) {
+        parseTiff(u8, i + 10, Math.min(u8.length, i + 2 + len), out); out.read = true; break;
+      }
+      i += 2 + len;
+    }
+  } catch (e) { /* 손상된 EXIF는 무시 — 사진 저장에는 영향 없음 */ }
+  return out;
+}
+function parseTiff(u8, t, end, out) {
+  const le = u8[t] === 0x49; const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const u16 = (o) => dv.getUint16(t + o, le), u32 = (o) => dv.getUint32(t + o, le);
+  const each = (off, cb) => { if (t + off + 2 > end) return 0; const n = u16(off); for (let k = 0; k < n; k++) { const e = off + 2 + k * 12; if (t + e + 12 > end) break; cb(u16(e), u32(e + 4), e + 8); } return n; };
+  const ascii = (count, voff) => { const off = count > 4 ? u32(voff) : voff; let s = ''; for (let k = 0; k < count && t + off + k < end; k++) { const c = u8[t + off + k]; if (!c) break; s += String.fromCharCode(c); } return s; };
+  let exifPtr = null, gpsPtr = null;
+  each(u32(4), (tag, count, voff) => { if (tag === 0x8769) exifPtr = u32(voff); if (tag === 0x8825) gpsPtr = u32(voff); });
+  if (exifPtr) each(exifPtr, (tag, count, voff) => {
+    if (tag === 0x9003) { const m = ascii(count, voff).match(/^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})/); if (m) out.takenAt = `${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]}`; }
+    if (tag === 0x9011) out.takenOffset = ascii(count, voff) || null;
+  });
+  if (gpsPtr) out.hasGps = each(gpsPtr, () => {}) > 0;
+}
+
 /* ---------- 저장공간 ---------- */
 async function storageCheck() {
   const box = $('storageMsg');
@@ -105,22 +139,38 @@ async function hasRoomFor(bytes) {
 let current = null; // 현재 열린 기록
 let lastBatch = []; // 방금 추가한 사진 id
 
+// 내보내기 상태: 'empty' 내용 없음 / 'never' 아직 안 함 / 'changed' 내보낸 뒤 바뀜 / 'ok' 최신
+const shortKind = (k) => ({ jpeg: 'JPG', heic: 'HEIC', png: 'PNG', webp: 'WEBP', gif: 'GIF', mov: 'MOV', unknown: '?' }[k] || k.toUpperCase().slice(0, 4));
+function exportState(r, photoCount) {
+  if (!photoCount && !r.notes.length) return { key: 'empty' };
+  if (!r.exports.length) return { key: 'never', text: '아직 내보내지 않음', cls: 'warn' };
+  const last = r.exports[r.exports.length - 1].at;
+  if (r.updatedAt && r.updatedAt > last) return { key: 'changed', text: `내보낸 뒤 바뀜 (마지막 ${localStr(last)})`, cls: 'warn' };
+  return { key: 'ok', text: `내보냄 ${localStr(last)}`, cls: 'ok' };
+}
+
 async function renderHome() {
   $('viewHome').classList.remove('hidden'); $('viewRecord').classList.add('hidden'); $('flash').innerHTML = '';
   const all = (await getAll('records')).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   const recs = all.filter((r) => !r.trashedAt), trash = all.filter((r) => r.trashedAt);
-  const ul = $('recordList'); ul.innerHTML = '';
+  const ul = $('recordList'); ul.innerHTML = ''; const pending = [];
   if (!recs.length) { ul.innerHTML = '<li class="status">아직 기록이 없습니다.</li>'; }
-  renderTrash(trash);
+  renderTrash(trash); renderDayCard(recs);
   for (const r of recs) {
     const photos = await getAll('photos', 'byRecord', r.id);
     const li = document.createElement('li');
     li.innerHTML = `<strong></strong><div class="status"></div>`;
     li.querySelector('strong').textContent = `${r.date} · ${r.place}`;
-    li.querySelector('.status').textContent = `${r.topic || '주제 없음'} · 사진 ${photos.length}장 · 메모 ${r.notes.length}개 · ${r.endedAt ? '기록 끝' : '기록 중'}${r.exports.length ? ' · 내보냄 ' + r.exports.length + '회' : ''}`;
+    li.querySelector('.status').textContent = `${r.topic || '주제 없음'} · 사진 ${photos.length}장 · 메모 ${r.notes.length}개 · ${r.endedAt ? '기록 끝' : '기록 중'}`;
+    const st = exportState(r, photos.length);
+    if (st.text) { const bd = document.createElement('span'); bd.className = 'badge ' + st.cls; bd.textContent = st.text; li.insertBefore(bd, li.querySelector('.status').nextSibling); }
+    if (st.key === 'never' || st.key === 'changed') pending.push(r.place);
     const b = document.createElement('button'); b.className = 'secondary'; b.textContent = '열기'; b.onclick = () => openRecord(r.id);
     li.appendChild(b); ul.appendChild(li);
   }
+  const pb = $('pendingMsg');
+  pb.classList.toggle('hidden', !pending.length);
+  if (pending.length) pb.textContent = `내보내지 않은(또는 내보낸 뒤 바뀐) 기록 ${pending.length}개: ${pending.join(', ')}. 휴대폰 분실·고장에 대비해 기록을 열어 '내보내기 묶음 만들기' → '파일로 저장'을 해 두세요.`;
   try { localStorage.setItem('dada.open', ''); } catch (e) { /* 무시 */ }
 }
 
@@ -187,6 +237,62 @@ async function deleteNote(n) {
 
 async function touch() { current.updatedAt = nowISO(); await putRecord(current); }
 
+/* ---------- 하루 일정 요약 MD ---------- */
+async function renderDayCard(recs) {
+  const dates = [...new Set(recs.map((r) => r.date))].sort().reverse();
+  $('dayCard').classList.toggle('hidden', !dates.length);
+  const sel = $('daySel'); const keep = sel.value; sel.innerHTML = '';
+  for (const d of dates) { const o = document.createElement('option'); o.value = d; o.textContent = `${d} (${recs.filter((r) => r.date === d).length}곳)`; sel.appendChild(o); }
+  if (dates.includes(keep)) sel.value = keep;
+}
+function recordSpan(r, photos) {
+  const shots = photos.map((p) => p.takenAt).filter(Boolean).sort();
+  if (shots.length) return { start: shots[0].slice(11, 16), end: shots[shots.length - 1].slice(11, 16), basis: '사진 촬영 시각' };
+  return { start: hhmm(r.createdAt), end: r.endedAt ? hhmm(r.endedAt) : '?', basis: '기록 시작·끝 시각' };
+}
+async function daySummaryMarkdown(date) {
+  const recs = (await getAll('records')).filter((r) => !r.trashedAt && r.date === date);
+  const items = [];
+  for (const r of recs) { const photos = (await getAll('photos', 'byRecord', r.id)).sort((a, b) => a.seq - b.seq); items.push({ r, photos, span: recordSpan(r, photos) }); }
+  items.sort((a, b) => a.span.start.localeCompare(b.span.start));
+  const np = items.reduce((s, x) => s + x.photos.length, 0), nn = items.reduce((s, x) => s + x.r.notes.length, 0);
+  const L = [`# 다다 하루 일정 — ${date}`, '', `- **방문**: ${items.length}곳 · **사진** ${np}장 · **메모** ${nn}개`, '',
+    '> 메모와 사진 설명은 사용자가 현장에서 직접 쓴 내용입니다. 사진 원본은 각 기록의 내보내기 묶음(ZIP)에 있습니다.', '', '## 동선', ''];
+  items.forEach((x, i) => L.push(`${i + 1}. **${x.span.start}~${x.span.end}** ${x.r.place}${x.r.topic ? ' — ' + x.r.topic : ''} (사진 ${x.photos.length}장)`));
+  const pending = items.filter((x) => { const st = exportState(x.r, x.photos.length); return st.key === 'never' || st.key === 'changed'; });
+  if (pending.length) L.push('', `> ⚠️ 아직 내보내지 않았거나 내보낸 뒤 바뀐 기록: ${pending.map((x) => x.r.place).join(', ')} — 사진 원본 묶음이 최신이 아닐 수 있습니다.`);
+  const tagged = {};
+  items.forEach((x, i) => {
+    L.push('', `## ${i + 1}. ${x.r.place} (${x.span.start}~${x.span.end})`, '', `- 주제: ${x.r.topic || '(없음)'}`, `- 시간 기준: ${x.span.basis}`, `- 기록번호: ${x.r.id}`, '', '### 메모', '');
+    if (!x.r.notes.length) L.push('(메모 없음)');
+    x.r.notes.forEach((n) => { L.push(`- [${hhmm(n.at)}] ${n.text.replace(/\n/g, ' / ')}`); noteTags(n.text).forEach((t) => (tagged[t.tag] = tagged[t.tag] || []).push(`${t.text || '(내용 없음)'} — ${x.r.place}`)); });
+    const caps = x.photos.filter((p) => p.caption);
+    if (caps.length) { L.push('', '### 사진 설명', ''); caps.forEach((p) => L.push(`- ${String(p.seq).padStart(3, '0')}${p.takenAt ? ` (촬영 ${p.takenAt.slice(11, 16)})` : ''}: ${p.caption}`)); }
+  });
+  if (Object.keys(tagged).length) {
+    L.push('', '## 꼬리표별 모음 (하루 전체)', '');
+    for (const t of TAGS) if (tagged[t]) { L.push(`### ${t}${t === '확인 필요' ? ' (블로그에 쓰기 전 사실 확인)' : ''}`, ''); tagged[t].forEach((v) => L.push('- ' + v)); L.push(''); }
+  }
+  return L.join('\n').replace(/\n{3,}/g, '\n\n') + '\n';
+}
+async function makeDaySummary() {
+  const date = $('daySel').value; if (!date) return;
+  const out = $('dayOut'); out.innerHTML = '';
+  try {
+    const md = await daySummaryMarkdown(date);
+    const f = new File([md], `다다_일정_${date}.md`, { type: 'text/markdown;charset=utf-8' });
+    const m = document.createElement('div'); m.className = 'msg ok'; m.textContent = `${f.name} 준비됨 (${(f.size / 1024).toFixed(1)}KB). 사진은 들어 있지 않은 글 요약입니다.`; out.appendChild(m);
+    const sh = document.createElement('button'); sh.textContent = '공유';
+    sh.onclick = async () => {
+      let ok = false; try { ok = !!(navigator.canShare && navigator.canShare({ files: [f] })); } catch (e) { /* 무시 */ }
+      if (!ok) { flash('이 기기에서는 공유 시트로 넘길 수 없습니다. "파일로 저장"을 쓰세요.', 'err'); return; }
+      try { await navigator.share({ files: [f], title: f.name }); } catch (e) { if (e.name !== 'AbortError') flash('공유 실패: ' + e.message, 'err'); }
+    };
+    const a = document.createElement('a'); a.className = 'btn'; a.style.background = '#e9e1d1'; a.style.color = '#1d2522'; a.href = URL.createObjectURL(f); a.download = f.name; a.textContent = '파일로 저장 (다운로드)';
+    out.append(sh, a);
+  } catch (e) { flash('요약을 만들지 못했습니다: ' + e.message, 'err'); }
+}
+
 async function startRecord() {
   const date = $('fDate').value, place = $('fPlace').value.trim(), topic = $('fTopic').value.trim();
   if (!date || !place) { flash('날짜와 장소를 입력하세요.', 'err'); return; }
@@ -200,9 +306,9 @@ async function openRecord(id) {
   $('flash').innerHTML = ''; $('exportOut').innerHTML = '';
   current = await getOne('records', id);
   if (!current || current.trashedAt) { current = null; return renderHome(); }
-  lastBatch = [];
+  lastBatch = []; endEditNote();
   try { localStorage.setItem('dada.open', id); } catch (e) { /* 무시 */ }
-  $('viewHome').classList.add('hidden'); $('viewRecord').classList.remove('hidden');
+  $('viewHome').classList.add('hidden'); $('viewRecord').classList.remove('hidden'); $('pendingMsg').classList.add('hidden');
   await renderRecord();
 }
 
@@ -223,7 +329,7 @@ async function renderRecord() {
   if (dupTries) badge(`같은 사진 재선택 ${dupTries}회 (다시 저장 안 함)`, 'warn');
   if (cross.length) badge(`다른 기록에도 있는 사진 ${cross.length}장`, 'warn');
   if (odd.length) badge(`형식 확인 필요/영상 ${odd.length}개`, 'warn');
-  if (r.exports.length) badge(`마지막 내보내기 ${hhmm(r.exports[r.exports.length - 1].at)}`, 'ok');
+  { const st = exportState(r, photos.length); if (st.text) badge(st.text, st.cls); }
   $('photoCount').textContent = `(${photos.length})`;
   $('noteCount').textContent = `(${r.notes.length})`;
   $('noteLinkLabel').textContent = lastBatch.length ? `방금 추가한 사진 ${lastBatch.length}장과 연결` : '방금 추가한 사진과 연결 (추가한 사진 없음)';
@@ -243,10 +349,19 @@ async function renderRecord() {
       d.appendChild(img);
     } else d.textContent = `${String(p.seq).padStart(3, '0')} ${p.kind}`;
     if (p.alsoIn && p.alsoIn.length) { const t = document.createElement('span'); t.className = 'dup'; t.textContent = '다른 기록에도 있음'; d.appendChild(t); }
-    const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = `${String(p.seq).padStart(3, '0')} ${p.kind.toUpperCase()}`; d.appendChild(tag);
+    const tag = document.createElement('span'); tag.className = 'tag'; tag.textContent = `${String(p.seq).padStart(3, '0')}${p.kind === 'jpeg' ? '' : ' ' + shortKind(p.kind)}`; d.appendChild(tag);
+    if (p.hasGps) { const g = document.createElement('span'); g.className = 'gps'; g.textContent = '위치'; d.appendChild(g); }
+    if (p.caption) { const cap = document.createElement('span'); cap.className = 'cap'; cap.textContent = p.caption; d.appendChild(cap); }
+    d.onclick = (ev) => { if (ev.target.closest('.del')) return; editCaption(p); };
     const x = document.createElement('button'); x.className = 'del'; x.type = 'button'; x.setAttribute('aria-label', `${p.seq}번 사진 지우기`); x.textContent = '×';
     x.onclick = () => deletePhoto(p); d.appendChild(x);
     th.appendChild(d);
+  }
+  const cl = $('captionList'); cl.innerHTML = '';
+  for (const p of photos) {
+    const li = document.createElement('li');
+    li.textContent = `${String(p.seq).padStart(3, '0')} · ${p.kind.toUpperCase()} · ${p.takenAt ? '촬영 ' + p.takenAt.slice(5, 16) : '촬영 시각 없음'}${p.hasGps ? ' · 위치정보 있음' : ''} — ${p.caption || '(설명 없음 · 사진을 눌러 추가)'}`;
+    cl.appendChild(li);
   }
   const nl = $('noteList'); nl.innerHTML = '';
   for (const n of r.notes) {
@@ -254,7 +369,11 @@ async function renderRecord() {
     const tx_ = document.createElement('div'); tx_.textContent = `[${hhmm(n.at)}] ${n.text}`; li.appendChild(tx_);
     if (n.photoIds.length) { const s = document.createElement('div'); s.className = 'status';
       s.textContent = '연결 사진: ' + n.photoIds.map((id) => { const p = photos.find((x) => x.id === id); return p ? String(p.seq).padStart(3, '0') : '?'; }).join(', '); li.appendChild(s); }
-    const del = document.createElement('button'); del.className = 'link-del'; del.type = 'button'; del.textContent = '메모 지우기'; del.onclick = () => deleteNote(n); li.appendChild(del);
+    if (n.editedAt) { const e = document.createElement('div'); e.className = 'status'; e.textContent = `고침 ${hhmm(n.editedAt)}`; li.appendChild(e); }
+    const row = document.createElement('div'); row.className = 'note-actions';
+    const ed = document.createElement('button'); ed.className = 'link-edit'; ed.type = 'button'; ed.textContent = '메모 고치기'; ed.onclick = () => startEditNote(n);
+    const del = document.createElement('button'); del.className = 'link-del'; del.type = 'button'; del.textContent = '메모 지우기'; del.onclick = () => deleteNote(n);
+    row.append(ed, del); li.appendChild(row);
     nl.appendChild(li);
   }
 }
@@ -281,11 +400,13 @@ async function addFiles(fileList) {
       const inThis = same.find((p) => p.recordId === current.id);
       if (inThis) { skipped.push(`${f.name} (=${String(inThis.seq).padStart(3, '0')}번)`); current.log.push({ type: 'duplicate_skipped', at: nowISO(), name: f.name, sha256: digest, same_as: inThis.id }); continue; }
       const det = detectKind(new Uint8Array(buf, 0, Math.min(32, buf.byteLength)));
+      const ex = det.kind === 'jpeg' ? readExif(new Uint8Array(buf, 0, Math.min(262144, buf.byteLength))) : { takenAt: null, takenOffset: null, hasGps: false, read: false };
       const photo = {
         id: digest.slice(0, 16) + '-' + current.id, recordId: current.id, seq: ++seq,
         originalName: f.name || `photo_${seq}`, mime: f.type || '', size: buf.byteLength, sha256: digest,
         lastModified: f.lastModified ? new Date(f.lastModified).toISOString() : null,
         addedAt: nowISO(), kind: det.kind, formatOk: det.ok, formatNote: det.note || '',
+        takenAt: ex.takenAt, takenOffset: ex.takenOffset, hasGps: ex.hasGps, exifRead: ex.read, caption: '',
         alsoIn: [...new Set(same.map((p) => p.recordId))],
       };
       const blob = new Blob([buf], { type: photo.mime || 'application/octet-stream' }); // File 참조가 아닌 실제 바이트 저장
@@ -316,9 +437,38 @@ async function addFiles(fileList) {
   await renderRecord(); storageCheck();
 }
 
+let editingNote = null;
+function startEditNote(n) {
+  editingNote = n; $('noteText').value = n.text; $('btnNote').textContent = '고친 메모 저장'; $('btnNoteCancel').classList.remove('hidden');
+  $('noteCard').scrollIntoView({ block: 'start' }); $('noteText').focus();
+}
+function endEditNote() { editingNote = null; $('noteText').value = ''; $('btnNote').textContent = '메모 저장'; $('btnNoteCancel').classList.add('hidden'); }
+async function editCaption(p) {
+  const v = prompt(`${String(p.seq).padStart(3, '0')}번 사진 한 줄 설명 (예: 첨성대 정면, 해 질 무렵)`, p.caption || '');
+  if (v === null) return;
+  const old = p.caption; p.caption = v.trim().slice(0, 200);
+  try { await tx(['photos'], 'readwrite', (t) => { t.objectStore('photos').put(p); }); await touch(); }
+  catch (e) { p.caption = old; flash('설명을 저장하지 못했습니다: ' + e.message, 'err'); return; }
+  flash(p.caption ? `${String(p.seq).padStart(3, '0')}번 사진 설명 저장됨.` : '설명을 지웠습니다.', 'ok'); await renderRecord();
+}
+function addTag(t) {
+  const ta = $('noteText'); const v = ta.value;
+  ta.value = v + (v && !v.endsWith('\n') ? '\n' : '') + `[${t}] `; ta.focus();
+  try { if (current) localStorage.setItem('dada.draft.' + current.id, ta.value); } catch (e) { /* 무시 */ }
+}
+
 async function saveNote() {
   const text = $('noteText').value.trim();
   if (!text) { flash('메모 내용을 입력하세요.', 'err'); return; }
+  if (editingNote) {
+    const n = editingNote, oldText = n.text, oldEd = n.editedAt;
+    if (text === oldText) { endEditNote(); return; }
+    n.text = text; n.editedAt = nowISO(); current.updatedAt = n.editedAt;
+    current.log.push({ type: 'note_edited', at: n.editedAt, note_id: n.id });
+    try { await putRecord(current); } catch (e) { n.text = oldText; n.editedAt = oldEd; current.log.pop(); flash('고친 메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
+    endEditNote(); try { localStorage.removeItem('dada.draft.' + current.id); } catch (e) { /* 무시 */ }
+    flash('메모를 고쳤습니다.', 'ok'); await renderRecord(); return;
+  }
   const note = { id: 'n' + Date.now().toString(36), at: nowISO(), text, photoIds: $('noteLink').checked ? [...lastBatch] : [] };
   current.notes.push(note); current.updatedAt = nowISO();
   try { await putRecord(current); } catch (e) { current.notes.pop(); flash('메모를 저장하지 못했습니다(입력 내용은 그대로 둡니다): ' + e.message, 'err'); return; }
@@ -330,7 +480,7 @@ async function saveNote() {
 
 async function finishRecord() {
   if (current.endedAt) { flash('이미 끝난 기록입니다. 사진·메모는 계속 추가할 수 있습니다.', 'info'); return; }
-  current.endedAt = nowISO();
+  current.endedAt = nowISO(); current.updatedAt = current.endedAt;
   try { await putRecord(current); } catch (e) { current.endedAt = null; flash('저장 실패: ' + e.message, 'err'); return; }
   const photos = await getAll('photos', 'byRecord', current.id);
   flash(`기록 끝. 사진 ${photos.length}장, 메모 ${current.notes.length}개입니다. 내보내기 전에 개수를 확인하세요.`, 'ok');
@@ -366,6 +516,14 @@ function buildZip(entries) { // entries: {name, data: Blob|Uint8Array, crc, size
 }
 
 // ChatGPT 등에 첨부할 때 읽기 쉬운 Markdown 요약. 사진 내용 설명은 넣지 않음(사진을 보지 않았으므로)
+function noteTags(text) { // [맛] 같은 꼬리표와 그 줄 내용
+  const out = []; const re = /\[([^\]\n]{1,10})\]\s*([^\n]*)/g; let m;
+  while ((m = re.exec(text))) if (TAGS.includes(m[1])) out.push({ tag: m[1], text: m[2].trim() });
+  return out;
+}
+const takenStr = (p) => (p.takenAt ? p.takenAt.slice(0, 16) + (p.takenOffset ? ` (${p.takenOffset})` : '') : '-');
+
+// ChatGPT 등에 첨부할 때 읽기 쉬운 Markdown 요약. 사진 내용은 사용자가 쓴 설명만 넣음(앱은 사진을 보지 않음)
 function notesMarkdown(r, photos, fileOf, partOf = {}, parts = 1) {
   const cell = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
   const total = photos.reduce((s, p) => s + p.size, 0);
@@ -374,22 +532,29 @@ function notesMarkdown(r, photos, fileOf, partOf = {}, parts = 1) {
     `- **기록 시간**: ${localStr(r.createdAt)} ~ ${r.endedAt ? localStr(r.endedAt) : '(기록 끝 누르지 않음)'}`,
     `- **사진**: ${photos.length}장 (${fmtMB(total)})${parts > 1 ? ` · 묶음 ${parts}개로 나뉨` : ''}`,
     `- **메모**: ${r.notes.length}개`, `- **기록번호**: ${r.id}`, '',
-    '> 아래 메모는 사용자가 현장에서 직접 쓴 내용입니다. 사진 목록은 파일 정보일 뿐이며 사진 내용 설명은 들어 있지 않습니다.', '',
-    '## 메모 (시간순)', ''];
+    '> 메모와 사진 설명은 사용자가 현장에서 직접 쓴 내용입니다. 그 밖의 사진 내용은 이 파일에 없습니다. 촬영 시각은 사진 파일에 기록된 값입니다.', ''];
+  const gps = photos.filter((p) => p.hasGps);
+  if (gps.length) L.push(`> ⚠️ 위치정보(GPS)가 들어 있는 사진 ${gps.length}장: 블로그에 올릴 때는 PC에서 만든 '위치 제거 사본'을 쓰세요. 원본은 보관용입니다.`, '');
+  L.push('## 메모 (시간순)', '');
   if (!r.notes.length) L.push('(메모 없음)', '');
   r.notes.forEach((n, i) => {
-    L.push(`### ${i + 1}. ${hhmm(n.at)}`, '', n.text, '');
+    L.push(`### ${i + 1}. ${hhmm(n.at)}${n.editedAt ? ` (고침 ${hhmm(n.editedAt)})` : ''}`, '', n.text, '');
     const linked = n.photoIds.map((id) => fileOf[id]).filter(Boolean);
     if (linked.length) L.push('연결 사진: ' + linked.map((f) => '`' + f + '`').join(', '), '');
   });
-  L.push('## 사진 목록', '', `| 번호 | 파일 | 형식 | 크기 | 추가 시각 | 연결 메모${parts > 1 ? ' | 묶음' : ''} |`, `|---|---|---|---|---|---${parts > 1 ? '|---' : ''}|`);
+  const tagged = {}; r.notes.forEach((n, i) => noteTags(n.text).forEach((t) => { (tagged[t.tag] = tagged[t.tag] || []).push(`${t.text || '(내용 없음)'} — 메모 ${i + 1}`); }));
+  if (Object.keys(tagged).length) {
+    L.push('## 꼬리표별 모음', '');
+    for (const t of TAGS) if (tagged[t]) { L.push(`### ${t}${t === '확인 필요' ? ' (블로그에 쓰기 전 사실 확인)' : ''}`, ''); tagged[t].forEach((x) => L.push('- ' + x)); L.push(''); }
+  }
+  L.push('## 사진 목록', '', `| 번호 | 파일 | 형식 | 크기 | 촬영 시각 | 설명 | 연결 메모${parts > 1 ? ' | 묶음' : ''} |`, `|---|---|---|---|---|---|---${parts > 1 ? '|---' : ''}|`);
   for (const p of photos) {
     const ns = r.notes.map((n, i) => (n.photoIds.includes(p.id) ? i + 1 : null)).filter(Boolean);
-    L.push(`| ${String(p.seq).padStart(3, '0')} | ${cell(fileOf[p.id])} | ${cell(p.kind.toUpperCase())}${p.formatOk ? '' : ' (확인 필요)'} | ${fmtMB(p.size)} | ${hhmm(p.addedAt)} | ${ns.length ? ns.map((x) => '메모 ' + x).join(', ') : '-'}${parts > 1 ? ` | ${partOf[p.id] || '-'}` : ''} |`);
+    L.push(`| ${String(p.seq).padStart(3, '0')} | ${cell(fileOf[p.id])} | ${cell(p.kind.toUpperCase())}${p.formatOk ? '' : ' (확인 필요)'}${p.hasGps ? ' · 위치' : ''} | ${fmtMB(p.size)} | ${cell(takenStr(p))} | ${cell(p.caption || '-')} | ${ns.length ? ns.map((x) => '메모 ' + x).join(', ') : '-'}${parts > 1 ? ` | ${partOf[p.id] || '-'}` : ''} |`);
   }
-  if (!photos.length) L.push('| - | (사진 없음) | | | | |');
-  const unlinked = photos.filter((p) => !r.notes.some((n) => n.photoIds.includes(p.id)));
-  if (photos.length) { L.push('', '## 메모가 연결되지 않은 사진', ''); L.push(unlinked.length ? unlinked.map((p) => '- `' + fileOf[p.id] + '`').join('\n') : '(없음 — 모든 사진에 메모가 연결됨)'); }
+  if (!photos.length) L.push('| - | (사진 없음) | | | | | |');
+  const unlinked = photos.filter((p) => !r.notes.some((n) => n.photoIds.includes(p.id)) && !p.caption);
+  if (photos.length) { L.push('', '## 메모·설명이 없는 사진', ''); L.push(unlinked.length ? unlinked.map((p) => '- `' + fileOf[p.id] + '`').join('\n') : '(없음 — 모든 사진에 메모나 설명이 있음)'); }
   return L.join('\n') + '\n';
 }
 
@@ -401,6 +566,8 @@ function notesText(r, photos, fileOf) {
     if (n.photoIds.length) lines.push('  연결 사진: ' + n.photoIds.map((id) => fileOf[id] || '(삭제됨)').join(', '));
   }
   if (!r.notes.length) lines.push('(메모 없음)');
+  const caps = photos.filter((p) => p.caption);
+  if (caps.length) { lines.push('', '사진 설명:'); caps.forEach((p) => lines.push(`  ${fileOf[p.id]}: ${p.caption}`)); }
   return lines.join('\n') + '\n';
 }
 
@@ -435,14 +602,15 @@ async function exportRecord() {
       index: p.seq, file: fileOf[p.id], original_name: p.originalName, mime: p.mime, detected_format: p.kind,
       format_supported: p.formatOk, format_note: p.formatNote, size: p.size, sha256: p.sha256,
       last_modified: p.lastModified, added_at: p.addedAt, also_in_records: p.alsoIn || [],
+      taken_at: p.takenAt || null, taken_offset: p.takenOffset || null, has_gps: !!p.hasGps, exif_read: !!p.exifRead, caption: p.caption || '',
       note_ids: r.notes.filter((n) => n.photoIds.includes(p.id)).map((n) => n.id),
       part: groups.findIndex((g) => g.includes(p)) + 1,
     }));
-    const manifestNotes = r.notes.map((n) => ({ id: n.id, at: n.at, text: n.text, photo_files: n.photoIds.map((id) => fileOf[id]).filter(Boolean) }));
+    const manifestNotes = r.notes.map((n) => ({ id: n.id, at: n.at, text: n.text, photo_files: n.photoIds.map((id) => fileOf[id]).filter(Boolean), edited_at: n.editedAt || null, tags: noteTags(n.text).map((t) => t.tag) }));
     // 전송 정보(exported_at, export_id, part)를 뺀 기록 본문 해시 — PC가 같은 규칙으로 다시 계산해 비교
     const body = {
       schema_version: SCHEMA_VERSION, record_id: r.id, date: r.date, place: r.place, topic: r.topic, started_at: r.createdAt, ended_at: r.endedAt,
-      photos: manifestPhotos.map((p) => ({ index: p.index, file: p.file, original_name: p.original_name, mime: p.mime, detected_format: p.detected_format, format_supported: p.format_supported, size: p.size, sha256: p.sha256 })),
+      photos: manifestPhotos.map((p) => ({ index: p.index, file: p.file, original_name: p.original_name, mime: p.mime, detected_format: p.detected_format, format_supported: p.format_supported, size: p.size, sha256: p.sha256, caption: p.caption, taken_at: p.taken_at })),
       notes: manifestNotes.map((n) => ({ id: n.id, at: n.at, text: n.text, photo_files: n.photo_files })),
     };
     const contentHash = await sha256(enc.encode(JSON.stringify(body)));
@@ -468,7 +636,7 @@ async function exportRecord() {
         export_id: exportId, exported_at: exportedAt, part: gi + 1, parts: groups.length,
         part_files: groups[gi].map((p) => fileOf[p.id]), part_bytes: groups[gi].reduce((s, p) => s + p.size, 0),
         photo_count: photos.length, total_bytes: photos.reduce((s, p) => s + p.size, 0),
-        content_hash: contentHash, notes_sha256: notesHash, notes_md_file: '기록.md', notes_md_sha256: mdHash,
+        content_hash: contentHash, content_hash_version: HASH_VERSION, notes_sha256: notesHash, notes_md_file: '기록.md', notes_md_sha256: mdHash,
         photos: manifestPhotos, notes: manifestNotes,
         events: r.log, uploaded: false, published: false,
       };
@@ -539,6 +707,9 @@ async function init() {
   $('btnExport').onclick = exportRecord;
   $('btnBack').onclick = () => { current = null; renderHome(); };
   $('btnTrash').onclick = trashRecord;
+  $('btnNoteCancel').onclick = endEditNote;
+  $('btnDay').onclick = makeDaySummary;
+  const chips = $('tagChips'); TAGS.forEach((t) => { const b = document.createElement('button'); b.type = 'button'; b.className = 'chip'; b.textContent = t; b.onclick = () => addTag(t); chips.appendChild(b); });
   $('appVersion').textContent = 'v' + APP_VERSION;
   // 메모 입력 중 앱이 닫혀도 초안 유지
   $('noteText').oninput = () => { try { if (current) localStorage.setItem('dada.draft.' + current.id, $('noteText').value); } catch (e) { /* 무시 */ } };
